@@ -3,12 +3,12 @@ name: Run Dork Parser Bot
 on:
   workflow_dispatch:      # Manual trigger from Actions tab
   schedule:
-    - cron: '0 */6 * * *' # Run every 6 hours (optional, adjust as needed)
+    - cron: '0 */6 * * *' # Runs every 6 hours (optional, adjust as needed)
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # Maximum 6 hours (GitHub limit)
+    timeout-minutes: 360   # Max 6 hours (GitHub limit)
 
     steps:
       - name: Checkout repository
@@ -48,4 +48,4 @@ jobs:
           EOF
 
       - name: Run Telegram Bot
-        run: python bot-1.py
+        run: python bot.py
