@@ -4,7 +4,7 @@
 ║   curl_cffi TLS fingerprint spoofing (chrome110)        ║
 ║   Parallel page fetching per dork (asyncio.gather)      ║
 ║   Full browser header rotation | Dynamic adaptive delay  ║
-║   Proxy rotation (HTTP/SOCKS) | DuckDuckGo + Yahoo       ║
+║   Proxy rotation (HTTP/SOCKS) | Yahoo + DuckDuckGo       ║
 ║   CAPTCHA detection hook | DNS caching via libcurl       ║
 ║   Chunked architecture | Global dedup | Tor rotation     ║
 ║   Manual proxy management: /addproxy /removeproxy       ║
@@ -66,7 +66,6 @@ TOR_PROXY             = os.environ.get("TOR_PROXY", "socks5://127.0.0.1:9050")
 OUTPUT_DIR            = Path("results")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# [CHANGED] DuckDuckGo + Yahoo only (Bing removed)
 ENGINES   = ["yahoo", "duckduckgo"]
 MAX_PAGES = 70
 
@@ -793,7 +792,7 @@ async def fetch_page_yahoo(
     [CHANGED] Uses curl_cffi AsyncSession.
     [CHANGED] Full browser header rotation.
     [NEW]     CAPTCHA hook.
-    [NEW]     Proxy fallback on CurlError proxy failure.
+    [NEW]     Proxy fallback on CurlError proxy failure (same pattern as Bing).
     """
     params = {
         "p":  dork,
@@ -802,6 +801,7 @@ async def fetch_page_yahoo(
         "vl": "lang_en",
     }
 
+    # [NEW] Proxy fallback tracking
     active_session   = session
     fallback_session = None
 
@@ -875,6 +875,7 @@ async def fetch_page_yahoo(
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
+                # [NEW] Proxy fallback on proxy-type CurlError
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
                     log.warning(
@@ -899,11 +900,13 @@ async def fetch_page_yahoo(
         return [], True
 
     finally:
+        # [NEW] Close fallback session; preserve original chunk session.
         if fallback_session is not None:
             await fallback_session.close()
 
 
 # ─── DUCKDUCKGO PAGE FETCH ────────────────────────────────────────────────────
+# [NEW] DuckDuckGo HTML endpoint — POST-based, no JavaScript, no API key needed
 async def fetch_page_duckduckgo(
     session: AsyncSession,
     dork: str, page: int, max_res: int,
@@ -913,13 +916,15 @@ async def fetch_page_duckduckgo(
     Fetch results from DuckDuckGo's HTML endpoint.
     DDG HTML does not support deep pagination; only page 1 is reliable.
     Uses POST to html.duckduckgo.com/html/.
-    [NEW] Proxy fallback on CurlError proxy failure.
+    [NEW] Proxy fallback on CurlError proxy failure (same pattern as Bing/Yahoo).
     """
     if page > 1:
         return [], False   # DDG HTML doesn't paginate reliably past page 1
 
+    # DDG pagination: 's' param (0 = page1, 30 = page2, etc.) — attempt if page > 1 skipped
     data = {"q": dork, "b": "", "kl": "us-en", "df": ""}
 
+    # [NEW] Proxy fallback tracking
     active_session   = session
     fallback_session = None
 
@@ -975,6 +980,7 @@ async def fetch_page_duckduckgo(
                 await asyncio.sleep(backoff)
 
             except CurlError as exc:
+                # [NEW] Proxy fallback on proxy-type CurlError
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
                     log.warning(
@@ -999,6 +1005,7 @@ async def fetch_page_duckduckgo(
         return [], True
 
     finally:
+        # [NEW] Close fallback session; preserve original chunk session.
         if fallback_session is not None:
             await fallback_session.close()
 
@@ -1026,6 +1033,8 @@ async def fetch_all_pages(
         "duckduckgo": fetch_page_duckduckgo,
     }[engine]
 
+    # [NEW] Stagger concurrent page requests (0.1–0.4s per page index) to
+    # avoid hammering the server with fully-simultaneous requests
     async def _fetch_with_stagger(page: int, idx: int) -> tuple:
         if idx > 0:
             await asyncio.sleep(random.uniform(0.1, 0.4) * idx)
@@ -1787,6 +1796,7 @@ async def cmd_engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "duckduckgo":  ["duckduckgo"],
             "ddg":         ["duckduckgo"],
             "all":         list(ENGINES),
+            "both":        list(ENGINES),
         }
         engines = engine_map.get(choice, list(ENGINES))
         get_session(chat_id)["engines"] = engines
