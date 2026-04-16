@@ -1241,6 +1241,20 @@ async def run_chunk(
             except asyncio.QueueFull:
                 pass
 
+        # Drain any results workers already placed in results_q before we
+        # cancel them — these would otherwise be silently discarded.
+        while True:
+            try:
+                dork, engine, scored, raw_cnt, deg_cnt = results_q.get_nowait()
+                processed      += 1
+                chunk_raw      += raw_cnt
+                chunk_degraded += deg_cnt
+                if raw_cnt == 0:
+                    empty_count += 1
+                chunk_scored.extend(scored)
+            except asyncio.QueueEmpty:
+                break
+
         for t in worker_tasks:
             if not t.done():
                 t.cancel()
@@ -1251,6 +1265,18 @@ async def run_chunk(
         for t in worker_tasks:
             t.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
+        # Drain any results already in the queue before propagating
+        while True:
+            try:
+                dork, engine, scored, raw_cnt, deg_cnt = results_q.get_nowait()
+                processed      += 1
+                chunk_raw      += raw_cnt
+                chunk_degraded += deg_cnt
+                if raw_cnt == 0:
+                    empty_count += 1
+                chunk_scored.extend(scored)
+            except asyncio.QueueEmpty:
+                break
         raise
     finally:
         global_watcher.cancel()
@@ -1440,12 +1466,12 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
 
     except asyncio.CancelledError:
-        log.info(f"[JOB][{chat_id}] Job cancelled")
+        log.info(f"[JOB][{chat_id}] Job force-cancelled — collecting partial results")
         global_stop_ev.set()
         for t in chunk_tasks:
             t.cancel()
-        await asyncio.gather(*chunk_tasks, return_exceptions=True)
-        raise
+        chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+        # Fall through to merge so partial results are still saved & sent
     finally:
         global_stop_ev.set()
         timeout_task.cancel()
@@ -1462,7 +1488,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
     failed_chunks    = 0
 
     for result in chunk_results:
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             log.error(f"[JOB][{chat_id}] Chunk raised: {result}")
             failed_chunks += 1
             continue
