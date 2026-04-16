@@ -1,15 +1,15 @@
 """
-╔══════════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v18.2 — FIXED YAHOO & DDG EXTRACTION      ║
-║   curl_cffi TLS fingerprint spoofing (chrome110)            ║
-║   Parallel page fetching per dork (asyncio.gather)          ║
-║   Full browser header rotation | Dynamic adaptive delay      ║
-║   Proxy rotation (HTTP/SOCKS) | DuckDuckGo JSON API          ║
-║   CAPTCHA detection hook | DNS caching via libcurl           ║
-║   Chunked architecture | Global dedup | Tor rotation         ║
-║   Manual proxy management: /addproxy /removeproxy           ║
-║   /proxylist /testproxy | Per-chunk proxy fallback          ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════╗
+║   DORK PARSER BOT v18.1 — STEALTH PARALLEL ARCHITECTURE ║
+║   curl_cffi TLS fingerprint spoofing (chrome110)        ║
+║   Parallel page fetching per dork (asyncio.gather)      ║
+║   Full browser header rotation | Dynamic adaptive delay  ║
+║   Proxy rotation (HTTP/SOCKS) | DuckDuckGo + Yahoo       ║
+║   CAPTCHA detection hook | DNS caching via libcurl       ║
+║   Chunked architecture | Global dedup | Tor rotation     ║
+║   Manual proxy management: /addproxy /removeproxy       ║
+║   /proxylist /testproxy | Per-chunk proxy fallback      ║
+╚══════════════════════════════════════════════════════════╝
 """
 
 import asyncio
@@ -24,7 +24,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
-# curl_cffi replaces aiohttp for TLS fingerprint spoofing
+# [CHANGED] curl_cffi replaces aiohttp for TLS fingerprint spoofing
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlError
 
@@ -55,20 +55,19 @@ BOT_TOKEN             = os.environ.get("BOT_TOKEN", "")
 N_CHUNKS              = int(os.environ.get("N_CHUNKS", 2))
 WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 8))
 MAX_WORKERS_PER_CHUNK = 20
+# [CHANGED] Fast mode delays: reduced to 0.5–1.0s after 3 consecutive hits
 MIN_DELAY             = float(os.environ.get("MIN_DELAY", 1.5))
 MAX_DELAY             = float(os.environ.get("MAX_DELAY", 3.0))
-FAST_MIN_DELAY        = 0.5
+FAST_MIN_DELAY        = 0.5   # used after 3 consecutive successful fetches
 FAST_MAX_DELAY        = 1.0
-FAST_STREAK_THRESHOLD = 3
+FAST_STREAK_THRESHOLD = 3     # hits needed to switch to fast mode
 MAX_RESULTS           = int(os.environ.get("MAX_RESULTS", 10))
 TOR_PROXY             = os.environ.get("TOR_PROXY", "socks5://127.0.0.1:9050")
 OUTPUT_DIR            = Path("results")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Added debug flag: set DEBUG_HTML=1 to save raw HTML for failed fetches
-DEBUG_HTML            = os.environ.get("DEBUG_HTML", "0") == "1"
-
-ENGINES   = ["bing", "yahoo", "duckduckgo"]
+# [CHANGED] DuckDuckGo + Yahoo only (Bing removed)
+ENGINES   = ["yahoo", "duckduckgo"]
 MAX_PAGES = 70
 
 # ─── RELIABILITY CONSTANTS ───────────────────────────────────────────────────
@@ -92,24 +91,43 @@ DEFAULT_SESSION = {
 
 user_sessions:   dict = {}
 active_jobs:     dict = {}
-active_stop_evs: dict = {}
+active_stop_evs: dict = {}   # chat_id → global_stop_ev for graceful /stop
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY MANAGEMENT (unchanged) ─────────────────────────────────────────────
+# ─── PROXY MANAGEMENT (v18.1 ENHANCED) ───────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+# [NEW] PROXY_ENABLED — global on/off switch independent of pool contents.
+#       Set PROXY_ENABLED=false in .env to disable proxies even if pool is loaded.
 PROXY_ENABLED: bool = os.environ.get("PROXY_ENABLED", "true").lower() not in ("false", "0", "no")
+
+# [NEW] Asyncio lock for safe in-memory pool mutations from concurrent commands
 _proxy_pool_lock: asyncio.Lock = asyncio.Lock()
+
+# [NEW] Regex for validating proxy URLs: http/https/socks5 with optional auth
 _PROXY_URL_RE = re.compile(
     r'^(https?|socks5?)://(?:[^:@/\s]+:[^:@/\s]+@)?[\w\-\.]+:\d{1,5}/?$',
     re.IGNORECASE,
 )
 
+
 def _validate_proxy_url(proxy_url: str) -> bool:
+    """
+    [NEW] Return True if proxy_url is a valid http/https/socks5 proxy URL.
+    Accepts:
+      socks5://user:pass@host:port
+      http://host:port
+      https://host:port
+    """
     return bool(_PROXY_URL_RE.match(proxy_url.strip()))
 
+
 def _parse_proxy_info(proxy_url: str) -> dict:
+    """
+    [NEW] Parse a proxy URL into its components for display.
+    Returns dict with keys: protocol, host, port, auth (bool).
+    """
     try:
         parsed = urlparse(proxy_url.strip())
         return {
@@ -121,7 +139,12 @@ def _parse_proxy_info(proxy_url: str) -> dict:
     except Exception:
         return {"protocol": "?", "host": str(proxy_url)[:30], "port": "?", "auth": False}
 
+
 def _persist_proxies() -> None:
+    """
+    [NEW] Write the current in-memory _proxy_pool to proxies.txt.
+    Called after every /addproxy or /removeproxy operation.
+    """
     try:
         with open("proxies.txt", "w", encoding="utf-8") as f:
             f.write("# Proxy list — managed by /addproxy and /removeproxy\n")
@@ -133,7 +156,12 @@ def _persist_proxies() -> None:
     except Exception as exc:
         log.warning(f"[PROXY] Failed to persist proxies.txt: {exc}")
 
+
 def _load_proxies() -> list:
+    """
+    Load proxy list from PROXY_LIST env var (comma-separated) or proxies.txt file.
+    Each proxy must be in format: http://host:port or socks5://user:pass@host:port
+    """
     proxies = []
     env_list = os.environ.get("PROXY_LIST", "").strip()
     if env_list:
@@ -151,17 +179,31 @@ def _load_proxies() -> list:
         log.info(f"[PROXY] Loaded {len(proxies)} proxies from proxies.txt")
     return proxies
 
+
 _proxy_pool: list = _load_proxies()
 
+
 def _get_random_proxy(exclude: str | None = None) -> str | None:
+    """
+    [CHANGED] Return a random proxy from the pool.
+    Respects PROXY_ENABLED global flag.
+    Optionally excludes a specific proxy URL (used for fallback rotation
+    so we don't retry with the same proxy that just failed).
+    """
     if not PROXY_ENABLED or not _proxy_pool:
         return None
     candidates = [p for p in _proxy_pool if p != exclude] if exclude else list(_proxy_pool)
     if not candidates:
+        # Only one proxy in pool and it's excluded — fall back to it anyway
         return _proxy_pool[0] if _proxy_pool else None
     return random.choice(candidates)
 
+
 def _is_proxy_error(exc: Exception) -> bool:
+    """
+    [NEW] Heuristic: detect if a CurlError is caused by a proxy failure
+    rather than a network/server issue, so we know to rotate to a new proxy.
+    """
     msg = str(exc).lower()
     proxy_keywords = (
         "proxy", "tunnel", "407", "socks", "authentication",
@@ -171,9 +213,11 @@ def _is_proxy_error(exc: Exception) -> bool:
     )
     return any(kw in msg for kw in proxy_keywords)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ─── TOR ROTATION (unchanged) ─────────────────────────────────────────────────
+
+# ─── TOR ROTATION ───────────────────────────────────────────────────────────
 _tor_rotation_task = None
 tor_enabled_users  = 0
 
@@ -215,7 +259,8 @@ def stop_tor_rotation() -> None:
         _tor_rotation_task = None
         log.info("Tor rotation task stopped")
 
-# ─── SQL FILTER ENGINE (unchanged) ───────────────────────────────────────────
+
+# ─── SQL FILTER ENGINE ───────────────────────────────────────────────────────
 BLACKLISTED_DOMAINS = {
     "yahoo.uservoice.com", "uservoice.com", "bing.com", "google.com", "googleapis.com",
     "gstatic.com", "youtube.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
@@ -226,6 +271,7 @@ BLACKLISTED_DOMAINS = {
     "aliexpress.com", "alibaba.com", "etsy.com", "walmart.com", "bestbuy.com",
     "capitaloneshopping.com", "onetonline.org", "moodle.", "lyrics.fi", "verkkouutiset.fi",
     "iltalehti.fi", "sapo.pt", "iol.pt", "idealo.", "zalando.", "trovaprezzi.",
+    # explicitly blocked per user request
     "whatsapp.com",
 }
 
@@ -256,6 +302,7 @@ _JUNK_RE = re.compile(
     r"/wp-content/uploads/",
     re.IGNORECASE,
 )
+
 
 def score_url(url: str) -> int:
     try:
@@ -302,14 +349,17 @@ def score_url(url: str) -> int:
 
     return max(0, min(score, 100))
 
+
 def filter_scored(urls: list, min_score: int) -> list:
     result = [(score_url(u), u) for u in urls]
     result = [(s, u) for s, u in result if s >= min_score]
     result.sort(reverse=True)
     return result
 
-# ─── URL CLEANER MODULE (unchanged) ──────────────────────────────────────────
+
+# ─── URL CLEANER MODULE ──────────────────────────────────────────────────────
 MAX_URL_LENGTH = 200
+
 
 def extract_domain(url: str) -> str:
     try:
@@ -318,11 +368,13 @@ def extract_domain(url: str) -> str:
     except Exception:
         return ""
 
+
 def is_blocked(domain: str) -> bool:
     for bd in BLACKLISTED_DOMAINS:
         if bd in domain:
             return True
     return False
+
 
 def has_query_params(url: str) -> bool:
     try:
@@ -330,12 +382,14 @@ def has_query_params(url: str) -> bool:
     except Exception:
         return False
 
+
 def is_valid_url(url: str) -> bool:
     try:
         p = urlparse(url)
         return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
         return False
+
 
 def filter_urls(urls: list) -> dict:
     total       = len(urls)
@@ -379,12 +433,18 @@ def filter_urls(urls: list) -> dict:
         "duplicates":  total - rm_invalid - rm_blocked - rm_no_query - rm_too_long - len(kept),
     }
 
-async def process_chunk_urls(chunk: list, semaphore: asyncio.Semaphore, stop_ev: asyncio.Event) -> list:
+
+async def process_chunk_urls(
+    chunk: list,
+    semaphore: asyncio.Semaphore,
+    stop_ev: asyncio.Event,
+) -> list:
     async with semaphore:
         if stop_ev.is_set():
             return []
         await asyncio.sleep(0)
         return filter_urls(chunk)["kept"]
+
 
 async def run_url_clean_job(chat_id: int, raw_lines: list, context) -> None:
     CLEAN_CHUNK_SIZE = 500
@@ -488,7 +548,9 @@ async def run_url_clean_job(chat_id: int, raw_lines: list, context) -> None:
     active_stop_evs.pop(chat_id, None)
     active_jobs.pop(chat_id, None)
 
-# ─── BROWSER PROFILES (unchanged) ────────────────────────────────────────────
+
+# ─── BROWSER PROFILES (Full header sets) ────────────────────────────────────
+# [NEW] Rotate complete realistic browser header sets per request
 BROWSER_PROFILES = [
     {   # Chrome 110 / Windows
         "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
@@ -556,21 +618,38 @@ BROWSER_PROFILES = [
     },
 ]
 
+
 def _random_headers() -> dict:
+    """Return a randomly chosen complete browser header set."""
     return dict(random.choice(BROWSER_PROFILES))
 
-# ─── SESSION FACTORY (unchanged) ─────────────────────────────────────────────
+
+# ─── SESSION FACTORY (curl_cffi) ─────────────────────────────────────────────
+# [CHANGED] Replaces aiohttp ClientSession with curl_cffi AsyncSession.
+# curl_cffi uses libcurl internally which provides:
+#   • TLS fingerprint spoofing (impersonate="chrome110")
+#   • Built-in DNS caching (equivalent to ttl_dns_cache=600)
+#   • HTTP/2 keep-alive connection reuse (replaces limit=0, force_close=False)
+#   • SOCKS5/HTTP proxy support natively
+
 def _make_isolated_session(use_tor: bool = False, proxy: str | None = None) -> AsyncSession:
+    """
+    Return a curl_cffi AsyncSession that mimics Chrome 110's TLS fingerprint.
+    Each chunk gets its own isolated session (no shared state).
+    Proxy priority: Tor > explicit proxy > random from pool (if PROXY_ENABLED).
+
+    [NEW] Stores chosen proxy on session._cur_proxy for fallback rotation logic.
+    """
     chosen_proxy = None
     if use_tor:
         chosen_proxy = TOR_PROXY
     elif proxy:
         chosen_proxy = proxy
-    elif PROXY_ENABLED and _proxy_pool:
+    elif PROXY_ENABLED and _proxy_pool:          # [CHANGED] respect PROXY_ENABLED
         chosen_proxy = _get_random_proxy()
 
     kwargs = {
-        "impersonate": "chrome110",
+        "impersonate": "chrome110",   # [CHANGED] TLS fingerprint spoofing
         "verify":      False,
         "timeout":     20,
     }
@@ -579,15 +658,29 @@ def _make_isolated_session(use_tor: bool = False, proxy: str | None = None) -> A
         log.debug(f"[SESSION] Using proxy: {chosen_proxy}")
 
     sess = AsyncSession(**kwargs)
-    sess._cur_proxy = chosen_proxy
+    sess._cur_proxy = chosen_proxy   # [NEW] store for per-request fallback
     return sess
 
+
 def _make_fallback_session(exclude_proxy: str | None = None) -> AsyncSession:
+    """
+    [NEW] Create a one-shot session with a fresh random proxy, excluding
+    the proxy that just failed. Used inside fetch functions on CurlError.
+    Returns a session with no proxy if pool is empty or all excluded.
+    """
     fb_proxy = _get_random_proxy(exclude=exclude_proxy)
     return _make_isolated_session(proxy=fb_proxy)
 
-# ─── CAPTCHA HANDLING (unchanged) ────────────────────────────────────────────
+
+# ─── CAPTCHA HANDLING PLACEHOLDER ────────────────────────────────────────────
+# [NEW] Hook called whenever CAPTCHA is detected in a response
 async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: str | None) -> None:
+    """
+    CAPTCHA detection hook.
+    Logs the event and applies a penalty backoff.
+    In a full implementation: mark current proxy as bad, pull a fresh one,
+    or signal Tor to rotate identity.
+    """
     log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA detected!")
     if session_proxy:
         log.info(f"[C{chunk_id}] Proxy {session_proxy} may be flagged — consider rotating")
@@ -595,7 +688,8 @@ async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy: str | 
     log.info(f"[C{chunk_id}] CAPTCHA backoff {backoff:.1f}s")
     await asyncio.sleep(backoff)
 
-# ─── DEGRADED RESPONSE DETECTION (FIXED: relaxed) ─────────────────────────────
+
+# ─── DEGRADED RESPONSE DETECTION ─────────────────────────────────────────────
 _CAPTCHA_RE = re.compile(
     r"captcha|are you a robot|unusual traffic|access denied|"
     r"verify you are human|please verify|too many requests|"
@@ -603,29 +697,34 @@ _CAPTCHA_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 def _is_degraded(html: str, engine: str) -> bool:
-    """Return True only if response is extremely small or contains captcha."""
-    # Very small response indicates an error or block
-    if len(html) < 500:
+    if len(html) < 400:
         return True
-    # Explicit captcha detection
     if _CAPTCHA_RE.search(html[:4096]):
         return True
-    # Engine-specific markers are no longer used as hard failures.
-    # Instead, we let the extractor attempt to find links; if none, it'll return empty.
+    if engine == "yahoo" and 'id="results"' not in html and "searchCenterMiddle" not in html:
+        return True
+    if engine == "duckduckgo" and "result__a" not in html and "results--main" not in html:
+        return True
     return False
 
+
 def _is_captcha(html: str) -> bool:
+    """Return True if the response specifically contains CAPTCHA signals."""
     return bool(_CAPTCHA_RE.search(html[:4096]))
 
-# ─── HTML LINK EXTRACTOR (unchanged, used by Bing) ───────────────────────────
+
+# ─── ROBUST HTML LINK EXTRACTOR ──────────────────────────────────────────────
 class _LinkExtractor(HTMLParser):
     __slots__ = ("links", "_in_cite", "_buf")
+
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.links: list = []
+        self.links: list  = []
         self._in_cite: bool = False
-        self._buf: list = []
+        self._buf:     list = []
+
     def handle_starttag(self, tag: str, attrs):
         if tag == "a":
             adict = dict(attrs)
@@ -636,6 +735,7 @@ class _LinkExtractor(HTMLParser):
         elif tag == "cite":
             self._in_cite = True
             self._buf.clear()
+
     def handle_endtag(self, tag: str):
         if tag == "cite" and self._in_cite:
             text = "".join(self._buf).strip()
@@ -643,9 +743,11 @@ class _LinkExtractor(HTMLParser):
                 self.links.append(text)
             self._in_cite = False
             self._buf.clear()
+
     def handle_data(self, data: str):
         if self._in_cite:
             self._buf.append(data)
+
 
 def _extract_links(html: str) -> list:
     p = _LinkExtractor()
@@ -655,261 +757,271 @@ def _extract_links(html: str) -> list:
         pass
     return p.links
 
-# ─── BING FETCH (unchanged) ──────────────────────────────────────────────────
-async def fetch_page_bing(session: AsyncSession, dork: str, page: int, max_res: int, chunk_id: int = 0) -> tuple:
-    params = {"q": dork, "count": min(max_res, 10), "first": (page - 1) * 10 + 1, "setlang": "en"}
-    active_session = session
-    fallback_session = None
-    try:
-        for attempt in range(MAX_RETRIES):
-            headers = _random_headers()
-            headers["Referer"] = "https://www.bing.com/"
-            try:
-                resp = await active_session.get("https://www.bing.com/search", params=params, headers=headers, timeout=20)
-                status = resp.status_code
-                html = resp.text
-                if status == 429:
-                    backoff = (2 ** attempt) * random.uniform(4.0, 8.0)
-                    log.warning(f"[C{chunk_id}][BING] p{page} rate-limited (429) — backoff {backoff:.1f}s")
-                    await asyncio.sleep(backoff)
-                    continue
-                if status != 200:
-                    log.warning(f"[C{chunk_id}][BING] p{page} non-200 status={status}")
-                    return [], False
-                if _is_captcha(html):
-                    await _on_captcha_detected("bing", chunk_id, getattr(active_session, "_cur_proxy", None))
-                    continue
-                if _is_degraded(html, "bing"):
-                    log.warning(f"[C{chunk_id}][BING] p{page} degraded ({len(html)/1024:.1f}KB)")
-                    if attempt < MAX_RETRIES - 1:
-                        await asyncio.sleep((2 ** attempt) * random.uniform(2.0, 5.0))
-                        continue
-                    return [], True
-                raw = _extract_links(html)
-                urls = [u for u in raw if u.startswith("http") and "bing.com" not in u.lower()]
-                urls = list(dict.fromkeys(urls))[:max_res]
-                log.info(f"[C{chunk_id}][BING] p{page} → {len(urls)} URLs")
-                return urls, False
-            except asyncio.TimeoutError:
-                backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
-                log.warning(f"[C{chunk_id}][BING] p{page} timeout — retry {backoff:.1f}s")
-                await asyncio.sleep(backoff)
-            except CurlError as exc:
-                if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
-                    cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    log.warning(f"[C{chunk_id}][BING] p{page} proxy error — switching fallback")
-                    if fallback_session:
-                        await fallback_session.close()
-                    fallback_session = _make_fallback_session(exclude_proxy=cur_proxy)
-                    active_session = fallback_session
-                    await asyncio.sleep(random.uniform(1.0, 2.5))
-                    continue
-                backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
-                log.warning(f"[C{chunk_id}][BING] p{page} CurlError={exc} — retry {backoff:.1f}s")
-                await asyncio.sleep(backoff)
-            except Exception as exc:
-                log.error(f"[C{chunk_id}][BING] p{page} unexpected: {exc}")
-                return [], False
-        return [], True
-    finally:
-        if fallback_session:
-            await fallback_session.close()
 
-# ─── YAHOO FETCH (FIXED: improved extraction) ─────────────────────────────────
-_YAHOO_RESULT_RE = re.compile(
-    r'<a[^>]*class="[^"]*ac-algo[^"]*"[^>]*href="(https?://[^"]+)"',
+# DDG-specific link extractor (result__a class links)
+_DDG_LINK_RE = re.compile(
+    r'class="result__a"[^>]*href="(https?://[^"]+)"',
     re.IGNORECASE,
 )
-_YAHOO_REDIRECT_RE = re.compile(r'/RU=([^/&]+)')
+_DDG_SNIPPET_RE = re.compile(r'uddg=(https?[^&"]+)', re.IGNORECASE)
 
-def _extract_yahoo_links(html: str) -> list:
-    """Extract real URLs from Yahoo search results page (current HTML)."""
-    urls = []
-    # First pass: find all result links with class containing "ac-algo"
-    for match in _YAHOO_RESULT_RE.finditer(html):
-        raw_url = unquote(match.group(1))
-        # Handle Yahoo redirect links
-        if "r.search.yahoo.com" in raw_url:
-            parsed = urlparse(raw_url)
-            qs = parse_qs(parsed.query)
-            if "RU" in qs:
-                real = unquote(qs["RU"][0])
-                if real.startswith(("http://", "https://")):
-                    urls.append(real)
-            else:
-                # Fallback: try path-based extraction
-                m = _YAHOO_REDIRECT_RE.search(parsed.path)
-                if m:
-                    real = unquote(m.group(1))
-                    if real.startswith(("http://", "https://")):
-                        urls.append(real)
-        elif raw_url.startswith(("http://", "https://")):
-            urls.append(raw_url)
-    # Second pass: generic link extraction for any missed links
-    generic = _extract_links(html)
-    for u in generic:
-        if u.startswith("http") and "yahoo.com" not in u.lower():
-            urls.append(u)
-    return list(dict.fromkeys(urls))
 
-async def fetch_page_yahoo(session: AsyncSession, dork: str, page: int, max_res: int, chunk_id: int = 0) -> tuple:
-    params = {"p": dork, "b": (page - 1) * 10 + 1, "pz": min(max_res, 10), "vl": "lang_en"}
-    active_session = session
+def _extract_ddg_links(html: str) -> list:
+    """Extract real URLs from DuckDuckGo HTML results page."""
+    links = []
+    for m in _DDG_LINK_RE.finditer(html):
+        links.append(unquote(m.group(1)))
+    for m in _DDG_SNIPPET_RE.finditer(html):
+        links.append(unquote(m.group(1)))
+    return links
+
+
+# ─── ENGINE NOISE FILTERS ────────────────────────────────────────────────────
+_YAHOO_NOISE   = re.compile(r"yimg\.com|yahoo\.com|doubleclick\.net|googleadservices", re.IGNORECASE)
+_STATIC_EXT    = re.compile(r"\.(css|js|png|jpg|jpeg|gif|svg|ico|webp|woff2?|ttf|eot)(\?|$)", re.IGNORECASE)
+_YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
+_DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
+
+
+# ─── YAHOO PAGE FETCH ────────────────────────────────────────────────────────
+async def fetch_page_yahoo(
+    session: AsyncSession,
+    dork: str, page: int, max_res: int,
+    chunk_id: int = 0,
+) -> tuple:
+    """
+    [CHANGED] Uses curl_cffi AsyncSession.
+    [CHANGED] Full browser header rotation.
+    [NEW]     CAPTCHA hook.
+    [NEW]     Proxy fallback on CurlError proxy failure.
+    """
+    params = {
+        "p":  dork,
+        "b":  (page - 1) * 10 + 1,
+        "pz": min(max_res, 10),
+        "vl": "lang_en",
+    }
+
+    active_session   = session
     fallback_session = None
+
     try:
         for attempt in range(MAX_RETRIES):
             headers = _random_headers()
             headers["Referer"] = "https://search.yahoo.com/"
             try:
-                resp = await active_session.get("https://search.yahoo.com/search", params=params, headers=headers, timeout=20)
-                status = resp.status_code
-                html = resp.text
+                resp    = await active_session.get(
+                    "https://search.yahoo.com/search",
+                    params=params,
+                    headers=headers,
+                    timeout=20,
+                )
+                status  = resp.status_code
+                html    = resp.text
+                size_kb = len(html) / 1024
+
+                log.debug(f"[C{chunk_id}][YAHOO] p{page} attempt={attempt+1} status={status} size={size_kb:.1f}KB")
+
                 if status == 429:
                     backoff = (2 ** attempt) * random.uniform(4.0, 8.0)
                     log.warning(f"[C{chunk_id}][YAHOO] p{page} rate-limited (429) — backoff {backoff:.1f}s")
                     await asyncio.sleep(backoff)
                     continue
+
                 if status != 200:
                     log.warning(f"[C{chunk_id}][YAHOO] p{page} non-200 status={status}")
                     return [], False
+
                 if _is_captcha(html):
                     await _on_captcha_detected("yahoo", chunk_id, getattr(active_session, "_cur_proxy", None))
                     continue
+
                 if _is_degraded(html, "yahoo"):
-                    log.warning(f"[C{chunk_id}][YAHOO] p{page} degraded ({len(html)/1024:.1f}KB)")
+                    log.warning(f"[C{chunk_id}][YAHOO] p{page} degraded ({size_kb:.1f}KB)")
                     if attempt < MAX_RETRIES - 1:
                         await asyncio.sleep((2 ** attempt) * random.uniform(2.0, 5.0))
                         continue
                     return [], True
-                urls = _extract_yahoo_links(html)
-                # Filter out static files and noise
-                urls = [u for u in urls if not re.search(r'\.(css|js|png|jpg|jpeg|gif|svg|ico|webp|woff2?)(\?|$)', u, re.I)]
+
+                raw  = _extract_links(html)
+                urls = []
+                for u in raw:
+                    if not u.startswith("http"):
+                        continue
+                    if "r.search.yahoo.com" in u or "/r/" in u:
+                        parsed = urlparse(u)
+                        qs     = parse_qs(parsed.query)
+                        if "RU" in qs:
+                            real = unquote(qs["RU"][0])
+                            if real.startswith(("http://", "https://")):
+                                u = real
+                        else:
+                            m = _YAHOO_RU_PATH.search(parsed.path)
+                            if m:
+                                real = unquote(m.group(1))
+                                if real.startswith(("http://", "https://")):
+                                    u = real
+                    if _YAHOO_NOISE.search(u) or _STATIC_EXT.search(u):
+                        continue
+                    urls.append(u)
+
                 urls = list(dict.fromkeys(urls))[:max_res]
-                if DEBUG_HTML and not urls:
-                    _save_debug_html("yahoo", page, chunk_id, html)
                 log.info(f"[C{chunk_id}][YAHOO] p{page} → {len(urls)} URLs (attempt={attempt+1})")
                 return urls, False
+
             except asyncio.TimeoutError:
                 backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
-                log.warning(f"[C{chunk_id}][YAHOO] p{page} timeout — retry {backoff:.1f}s")
+                log.warning(f"[C{chunk_id}][YAHOO] p{page} timeout attempt={attempt+1} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
+
             except CurlError as exc:
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    log.warning(f"[C{chunk_id}][YAHOO] p{page} proxy error — switching fallback")
-                    if fallback_session:
+                    log.warning(
+                        f"[C{chunk_id}][YAHOO] p{page} proxy error on attempt {attempt+1} "
+                        f"({exc}) — switching to fallback proxy"
+                    )
+                    if fallback_session is not None:
                         await fallback_session.close()
                     fallback_session = _make_fallback_session(exclude_proxy=cur_proxy)
-                    active_session = fallback_session
+                    active_session   = fallback_session
                     await asyncio.sleep(random.uniform(1.0, 2.5))
                     continue
                 backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
                 log.warning(f"[C{chunk_id}][YAHOO] p{page} CurlError={exc} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
+
             except Exception as exc:
                 log.error(f"[C{chunk_id}][YAHOO] p{page} unexpected: {exc}")
                 return [], False
+
+        log.warning(f"[C{chunk_id}][YAHOO] p{page} all {MAX_RETRIES} attempts exhausted")
         return [], True
+
     finally:
-        if fallback_session:
+        if fallback_session is not None:
             await fallback_session.close()
 
-# ─── DUCKDUCKGO FETCH (FIXED: switched to JSON API) ───────────────────────────
-async def fetch_page_duckduckgo(session: AsyncSession, dork: str, page: int, max_res: int, chunk_id: int = 0) -> tuple:
-    """Use DuckDuckGo JSON API (no pagination beyond first page)."""
-    if page > 1:
-        # JSON API does not support pagination; return empty for pages >1
-        return [], False
 
-    params = {
-        "q": dork,
-        "format": "json",
-        "no_html": 1,
-        "skip_disambig": 1,
-        "t": "dork_parser_bot",  # optional identifier
-    }
-    active_session = session
+# ─── DUCKDUCKGO PAGE FETCH ────────────────────────────────────────────────────
+async def fetch_page_duckduckgo(
+    session: AsyncSession,
+    dork: str, page: int, max_res: int,
+    chunk_id: int = 0,
+) -> tuple:
+    """
+    Fetch results from DuckDuckGo's HTML endpoint.
+    DDG HTML does not support deep pagination; only page 1 is reliable.
+    Uses POST to html.duckduckgo.com/html/.
+    [NEW] Proxy fallback on CurlError proxy failure.
+    """
+    if page > 1:
+        return [], False   # DDG HTML doesn't paginate reliably past page 1
+
+    data = {"q": dork, "b": "", "kl": "us-en", "df": ""}
+
+    active_session   = session
     fallback_session = None
+
     try:
         for attempt in range(MAX_RETRIES):
             headers = _random_headers()
-            headers["Referer"] = "https://duckduckgo.com/"
+            headers["Referer"]      = "https://duckduckgo.com/"
+            headers["Origin"]       = "https://html.duckduckgo.com"
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
             try:
-                resp = await active_session.get("https://api.duckduckgo.com", params=params, headers=headers, timeout=20)
-                status = resp.status_code
+                resp    = await active_session.post(
+                    "https://html.duckduckgo.com/html/",
+                    data=data,
+                    headers=headers,
+                    timeout=20,
+                )
+                status  = resp.status_code
+                html    = resp.text
+                size_kb = len(html) / 1024
+
+                log.debug(f"[C{chunk_id}][DDG] p{page} attempt={attempt+1} status={status} size={size_kb:.1f}KB")
+
                 if status == 429:
                     backoff = (2 ** attempt) * random.uniform(5.0, 10.0)
-                    log.warning(f"[C{chunk_id}][DDG] rate-limited (429) — backoff {backoff:.1f}s")
+                    log.warning(f"[C{chunk_id}][DDG] p{page} rate-limited — backoff {backoff:.1f}s")
                     await asyncio.sleep(backoff)
                     continue
+
                 if status != 200:
-                    log.warning(f"[C{chunk_id}][DDG] non-200 status={status}")
+                    log.warning(f"[C{chunk_id}][DDG] p{page} non-200 status={status}")
                     return [], False
-                data = resp.json()
-                urls = []
-                # Results array (main search results)
-                for r in data.get("Results", []):
-                    if "FirstURL" in r:
-                        urls.append(r["FirstURL"])
-                # RelatedTopics may contain nested results
-                for topic in data.get("RelatedTopics", []):
-                    if "FirstURL" in topic:
-                        urls.append(topic["FirstURL"])
-                    elif "Topics" in topic:
-                        for subtopic in topic["Topics"]:
-                            if "FirstURL" in subtopic:
-                                urls.append(subtopic["FirstURL"])
-                # Clean and limit
-                urls = [u for u in urls if u.startswith("http") and "duckduckgo.com" not in u.lower()]
+
+                if _is_captcha(html):
+                    await _on_captcha_detected("duckduckgo", chunk_id, getattr(active_session, "_cur_proxy", None))
+                    continue
+
+                if _is_degraded(html, "duckduckgo"):
+                    log.warning(f"[C{chunk_id}][DDG] p{page} degraded ({size_kb:.1f}KB)")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep((2 ** attempt) * random.uniform(2.0, 5.0))
+                        continue
+                    return [], True
+
+                raw  = _extract_ddg_links(html)
+                urls = [u for u in raw if u.startswith("http") and not _DDG_NOISE.search(u) and not _STATIC_EXT.search(u)]
                 urls = list(dict.fromkeys(urls))[:max_res]
-                log.info(f"[C{chunk_id}][DDG] → {len(urls)} URLs (attempt={attempt+1})")
+                log.info(f"[C{chunk_id}][DDG] p{page} → {len(urls)} URLs (attempt={attempt+1})")
                 return urls, False
+
             except asyncio.TimeoutError:
                 backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
-                log.warning(f"[C{chunk_id}][DDG] timeout — retry {backoff:.1f}s")
+                log.warning(f"[C{chunk_id}][DDG] p{page} timeout attempt={attempt+1} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
+
             except CurlError as exc:
                 if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1 and attempt < MAX_RETRIES - 1:
                     cur_proxy = getattr(active_session, "_cur_proxy", None)
-                    log.warning(f"[C{chunk_id}][DDG] proxy error — switching fallback")
-                    if fallback_session:
+                    log.warning(
+                        f"[C{chunk_id}][DDG] p{page} proxy error on attempt {attempt+1} "
+                        f"({exc}) — switching to fallback proxy"
+                    )
+                    if fallback_session is not None:
                         await fallback_session.close()
                     fallback_session = _make_fallback_session(exclude_proxy=cur_proxy)
-                    active_session = fallback_session
+                    active_session   = fallback_session
                     await asyncio.sleep(random.uniform(1.0, 2.5))
                     continue
                 backoff = (2 ** attempt) * random.uniform(2.0, 4.0)
-                log.warning(f"[C{chunk_id}][DDG] CurlError={exc} — retry {backoff:.1f}s")
+                log.warning(f"[C{chunk_id}][DDG] p{page} CurlError={exc} — retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
+
             except Exception as exc:
-                log.error(f"[C{chunk_id}][DDG] unexpected: {exc}")
+                log.error(f"[C{chunk_id}][DDG] p{page} unexpected: {exc}")
                 return [], False
+
+        log.warning(f"[C{chunk_id}][DDG] p{page} all {MAX_RETRIES} attempts exhausted")
         return [], True
+
     finally:
-        if fallback_session:
+        if fallback_session is not None:
             await fallback_session.close()
 
-# Helper for debug HTML saving
-def _save_debug_html(engine: str, page: int, chunk_id: int, html: str):
-    if not DEBUG_HTML:
-        return
-    try:
-        fname = f"debug_{engine}_p{page}_c{chunk_id}_{int(time.time())}.html"
-        with open(fname, "w", encoding="utf-8") as f:
-            f.write(html)
-        log.info(f"[DEBUG] Saved HTML to {fname}")
-    except Exception as e:
-        log.warning(f"[DEBUG] Failed to save HTML: {e}")
 
-# ─── FETCH ALL PAGES (unchanged) ─────────────────────────────────────────────
-async def fetch_all_pages(session: AsyncSession, dork: str, engine: str, pages: list, max_res: int, chunk_id: int = 0) -> tuple:
+# ─── FETCH ALL PAGES (Parallel) ───────────────────────────────────────────────
+# [CHANGED] Uses asyncio.gather to fetch multiple pages concurrently per dork
+async def fetch_all_pages(
+    session: AsyncSession,
+    dork: str, engine: str,
+    pages: list, max_res: int,
+    chunk_id: int = 0,
+) -> tuple:
+    """
+    [CHANGED] Fetches all pages for a dork concurrently using asyncio.gather.
+    Pages are staggered with small random delays to avoid synchronized bursts.
+    DDG only supports page 1 reliably; additional pages are skipped for it.
+    """
     if engine == "duckduckgo":
-        sorted_pages = [min(pages)]
+        sorted_pages = [min(pages)]   # DDG: only first page
     else:
         sorted_pages = sorted(pages)
 
     fetch_fn = {
-        "bing":       fetch_page_bing,
         "yahoo":      fetch_page_yahoo,
         "duckduckgo": fetch_page_duckduckgo,
     }[engine]
@@ -919,10 +1031,10 @@ async def fetch_all_pages(session: AsyncSession, dork: str, engine: str, pages: 
             await asyncio.sleep(random.uniform(0.1, 0.4) * idx)
         return await fetch_fn(session, dork, page, max_res, chunk_id)
 
-    tasks = [_fetch_with_stagger(p, i) for i, p in enumerate(sorted_pages)]
+    tasks   = [_fetch_with_stagger(p, i) for i, p in enumerate(sorted_pages)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    all_urls = []
+    all_urls       = []
     degraded_total = 0
     for i, res in enumerate(results):
         if isinstance(res, Exception):
@@ -935,22 +1047,41 @@ async def fetch_all_pages(session: AsyncSession, dork: str, engine: str, pages: 
 
     return all_urls, degraded_total
 
-# ─── WORKER (unchanged) ───────────────────────────────────────────────────────
-async def dork_worker(wid: int, chunk_id: int, queue: asyncio.Queue, results_q: asyncio.Queue,
-                      engines: list, pages: list, max_res: int, session: AsyncSession,
-                      min_score: int, stop_ev: asyncio.Event, slowdown_ev: asyncio.Event) -> None:
-    eidx = wid % len(engines)
-    empty_streak = 0
-    consecutive_hits = 0
+
+# ─── WORKER ───────────────────────────────────────────────────────────────────
+async def dork_worker(
+    wid: int,
+    chunk_id: int,
+    queue: asyncio.Queue,
+    results_q: asyncio.Queue,
+    engines: list,
+    pages: list,
+    max_res: int,
+    session: AsyncSession,
+    min_score: int,
+    stop_ev: asyncio.Event,
+    slowdown_ev: asyncio.Event,
+) -> None:
+    """
+    [CHANGED] Dynamic adaptive delay:
+      - After FAST_STREAK_THRESHOLD consecutive successes → fast mode (0.5–1.0s)
+      - On empty/degraded → revert to normal delay + exponential backoff
+    """
+    eidx               = wid % len(engines)
+    empty_streak       = 0
+    consecutive_hits   = 0   # [NEW] track consecutive successes for fast mode
+
     while not stop_ev.is_set():
         try:
             dork = await asyncio.wait_for(queue.get(), timeout=2.0)
         except asyncio.TimeoutError:
             continue
+
         engine = engines[eidx % len(engines)]
-        eidx += 1
+        eidx  += 1
         log.info(f"[C{chunk_id}][W{wid}][{engine.upper()}] {dork[:55]}")
-        raw = []
+
+        raw          = []
         degraded_cnt = 0
         try:
             raw, degraded_cnt = await asyncio.wait_for(
@@ -971,60 +1102,93 @@ async def dork_worker(wid: int, chunk_id: int, queue: asyncio.Queue, results_q: 
 
         scored = filter_scored(raw, min_score)
         log.info(f"[C{chunk_id}][W{wid}] raw={len(raw)} kept={len(scored)} degraded={degraded_cnt}")
+
         try:
             results_q.put_nowait((dork, engine, scored, len(raw), degraded_cnt))
         except asyncio.QueueFull:
             await results_q.put((dork, engine, scored, len(raw), degraded_cnt))
+
         queue.task_done()
 
+        # [CHANGED] Dynamic adaptive delay
         if raw:
             consecutive_hits += 1
-            empty_streak = 0
+            empty_streak       = 0
+            # Fast mode after FAST_STREAK_THRESHOLD consecutive hits
             if consecutive_hits >= FAST_STREAK_THRESHOLD:
                 delay = random.uniform(FAST_MIN_DELAY, FAST_MAX_DELAY)
+                log.debug(f"[C{chunk_id}][W{wid}] FAST mode delay={delay:.2f}s (streak={consecutive_hits})")
             else:
                 delay = random.uniform(MIN_DELAY, MAX_DELAY)
         else:
             consecutive_hits = 0
-            empty_streak += 1
+            empty_streak    += 1
             delay = random.uniform(MIN_DELAY, MAX_DELAY)
             if empty_streak >= 3:
                 extra = min(empty_streak * 2.0, 15.0)
+                log.info(f"[C{chunk_id}][W{wid}] Auto-slowdown +{extra:.1f}s (empty_streak={empty_streak})")
                 delay += extra
+
+        # Chunk-level slowdown signal
         if slowdown_ev.is_set():
             delay += random.uniform(2.0, 5.0)
+
         await asyncio.sleep(delay)
 
-# ─── CHUNK RUNNER (unchanged) ─────────────────────────────────────────────────
-async def run_chunk(chunk_id: int, dorks: list, engines: list, pages: list, max_res: int,
-                    use_tor: bool, min_score: int, workers_n: int, progress_q: asyncio.Queue,
-                    global_stop_ev: asyncio.Event, proxy: str | None = None) -> dict:
-    session = _make_isolated_session(use_tor=use_tor, proxy=proxy)
-    queue = asyncio.Queue(maxsize=len(dorks) * 2)
-    results_q = asyncio.Queue(maxsize=500)
-    stop_ev = asyncio.Event()
+
+# ─── CHUNK RUNNER ─────────────────────────────────────────────────────────────
+async def run_chunk(
+    chunk_id: int,
+    dorks: list,
+    engines: list,
+    pages: list,
+    max_res: int,
+    use_tor: bool,
+    min_score: int,
+    workers_n: int,
+    progress_q: asyncio.Queue,
+    global_stop_ev: asyncio.Event,
+    proxy: str | None = None,
+) -> dict:
+    """
+    [CHANGED] Accepts an optional per-chunk proxy argument.
+    [CHANGED] Session created via curl_cffi _make_isolated_session.
+    """
+    session     = _make_isolated_session(use_tor=use_tor, proxy=proxy)
+    queue       = asyncio.Queue(maxsize=len(dorks) * 2)
+    results_q   = asyncio.Queue(maxsize=500)
+    stop_ev     = asyncio.Event()
     slowdown_ev = asyncio.Event()
+
     for d in dorks:
         await queue.put(d)
-    total = len(dorks)
-    processed = 0
-    empty_count = 0
-    chunk_raw = 0
+
+    total          = len(dorks)
+    processed      = 0
+    empty_count    = 0
+    chunk_raw      = 0
     chunk_degraded = 0
-    chunk_scored = []
+    chunk_scored   = []
+
     log.info(f"[C{chunk_id}] Starting — {total} dorks | {workers_n} workers | engines={engines}")
-    async def _watch_global():
+
+    async def _watch_global() -> None:
         while not stop_ev.is_set():
             if global_stop_ev.is_set():
                 stop_ev.set()
             await asyncio.sleep(0.5)
+
     worker_tasks = [
         asyncio.create_task(
-            dork_worker(i, chunk_id, queue, results_q, engines, pages, max_res,
-                        session, min_score, stop_ev, slowdown_ev)
-        ) for i in range(workers_n)
+            dork_worker(
+                i, chunk_id, queue, results_q, engines, pages,
+                max_res, session, min_score, stop_ev, slowdown_ev,
+            )
+        )
+        for i in range(workers_n)
     ]
     global_watcher = asyncio.create_task(_watch_global())
+
     try:
         while processed < total and not stop_ev.is_set():
             try:
@@ -1033,15 +1197,22 @@ async def run_chunk(chunk_id: int, dorks: list, engines: list, pages: list, max_
                 )
             except asyncio.TimeoutError:
                 if all(t.done() for t in worker_tasks):
-                    log.warning(f"[C{chunk_id}] All workers done with {total - processed} dorks unaccounted — exiting early")
+                    log.warning(
+                        f"[C{chunk_id}] All workers done with "
+                        f"{total - processed} dorks unaccounted — exiting early"
+                    )
                     break
                 continue
-            processed += 1
-            chunk_raw += raw_cnt
+
+            processed      += 1
+            chunk_raw      += raw_cnt
             chunk_degraded += deg_cnt
+
             if raw_cnt == 0:
                 empty_count += 1
+
             chunk_scored.extend(scored)
+
             empty_rate = empty_count / max(processed, 1)
             if empty_rate >= EMPTY_RATE_SLOWDOWN and not slowdown_ev.is_set():
                 log.warning(f"[C{chunk_id}] Empty rate {empty_rate:.0%} — enabling chunk slowdown")
@@ -1049,20 +1220,23 @@ async def run_chunk(chunk_id: int, dorks: list, engines: list, pages: list, max_
             elif empty_rate < EMPTY_RATE_RECOVER and slowdown_ev.is_set():
                 log.info(f"[C{chunk_id}] Empty rate recovered to {empty_rate:.0%} — disabling slowdown")
                 slowdown_ev.clear()
+
             try:
                 progress_q.put_nowait({
-                    "chunk_id": chunk_id,
+                    "chunk_id":  chunk_id,
                     "processed": processed,
-                    "total": total,
-                    "raw": raw_cnt,
-                    "kept": len(scored),
+                    "total":     total,
+                    "raw":       raw_cnt,
+                    "kept":      len(scored),
                 })
             except asyncio.QueueFull:
                 pass
+
         for t in worker_tasks:
             if not t.done():
                 t.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
+
     except asyncio.CancelledError:
         stop_ev.set()
         for t in worker_tasks:
@@ -1073,41 +1247,65 @@ async def run_chunk(chunk_id: int, dorks: list, engines: list, pages: list, max_
         global_watcher.cancel()
         await asyncio.gather(global_watcher, return_exceptions=True)
         await session.close()
+
     success_rate = (processed - empty_count) / max(processed, 1)
-    log.info(f"[C{chunk_id}] Done — processed={processed}/{total} raw={chunk_raw} kept={len(chunk_scored)} degraded={chunk_degraded} success_rate={success_rate:.0%}")
+    log.info(
+        f"[C{chunk_id}] Done — processed={processed}/{total} "
+        f"raw={chunk_raw} kept={len(chunk_scored)} "
+        f"degraded={chunk_degraded} success_rate={success_rate:.0%}"
+    )
+
     return {
-        "chunk_id": chunk_id,
-        "scored": chunk_scored,
-        "raw_count": chunk_raw,
+        "chunk_id":       chunk_id,
+        "scored":         chunk_scored,
+        "raw_count":      chunk_raw,
         "degraded_count": chunk_degraded,
-        "processed": processed,
-        "empty_count": empty_count,
+        "processed":      processed,
+        "empty_count":    empty_count,
     }
 
-# ─── JOB RUNNER (unchanged) ───────────────────────────────────────────────────
+
+# ─── JOB RUNNER ───────────────────────────────────────────────────────────────
 async def run_dork_job(chat_id: int, dorks: list, context) -> None:
-    sess = get_session(chat_id)
-    engines = sess.get("engines", list(ENGINES))
+    """
+    [CHANGED] Passes a randomly assigned proxy per chunk (from pool if available).
+    All existing features (chunking, scoring, filtering, Tor, stop, progress) intact.
+    """
+    sess      = get_session(chat_id)
+    engines   = sess.get("engines", list(ENGINES))
     workers_n = min(sess.get("workers", WORKERS_PER_CHUNK), MAX_WORKERS_PER_CHUNK)
-    max_res = sess.get("max_results", MAX_RESULTS)
-    pages = sess.get("pages", [1])
-    use_tor = sess.get("tor", False)
+    max_res   = sess.get("max_results", MAX_RESULTS)
+    pages     = sess.get("pages", [1])
+    use_tor   = sess.get("tor", False)
     min_score = sess.get("min_score", 30)
-    n_chunks = max(1, sess.get("chunks", N_CHUNKS))
+    n_chunks  = max(1, sess.get("chunks", N_CHUNKS))
+
     total_dorks = len(dorks)
-    pages_str = ", ".join(str(p) for p in pages)
-    start_time = time.time()
-    chunk_size = max(1, -(-total_dorks // n_chunks))
-    chunks = [dorks[i : i + chunk_size] for i in range(0, total_dorks, chunk_size)]
+    pages_str   = ", ".join(str(p) for p in pages)
+    start_time  = time.time()
+
+    chunk_size    = max(1, -(-total_dorks // n_chunks))
+    chunks        = [dorks[i : i + chunk_size] for i in range(0, total_dorks, chunk_size)]
     actual_chunks = len(chunks)
-    log.info(f"[JOB][{chat_id}] Starting: {total_dorks} dorks → {actual_chunks} chunks × {workers_n} workers/chunk")
-    tmp_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, prefix=f"dork_{chat_id}_", suffix=".txt")
+
+    log.info(
+        f"[JOB][{chat_id}] Starting: {total_dorks} dorks → "
+        f"{actual_chunks} chunks × {workers_n} workers/chunk | "
+        f"delay={MIN_DELAY}–{MAX_DELAY}s (fast={FAST_MIN_DELAY}–{FAST_MAX_DELAY}s)"
+    )
+
+    tmp_file = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", delete=False,
+        prefix=f"dork_{chat_id}_", suffix=".txt",
+    )
     tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v18.2 — SQL Targeted Results\n")
+    tmp_file.write(f"# Dork Parser v18.1 — SQL Targeted Results\n")
     tmp_file.write(f"# Date   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     tmp_file.write(f"# Dorks  : {total_dorks} | Pages: {pages_str}\n")
     tmp_file.write(f"# Filter : SQL ≥{min_score} | Chunks: {actual_chunks}\n")
     tmp_file.close()
+
+    # [CHANGED] Show PROXY_ENABLED state in job status header
     if use_tor:
         proxy_info = "🧅 TOR"
     elif PROXY_ENABLED and _proxy_pool:
@@ -1116,9 +1314,10 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         proxy_info = f"⏸ Proxy disabled ({len(_proxy_pool)} loaded, PROXY_ENABLED=false)"
     else:
         proxy_info = "🔓 Direct (no proxy)"
+
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v18.2 — STARTED\n"
+        f"🕷 DORK PARSER v18.1 — STARTED\n"
         f"{'━'*30}\n"
         f"📋 Dorks   : {total_dorks}\n"
         f"📄 Pages   : {pages_str}\n"
@@ -1130,35 +1329,45 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         f"🔒 TLS     : Chrome110 fingerprint\n"
         f"{'━'*30}\n⏳ Starting chunks...",
     )
+
     global_stop_ev = asyncio.Event()
     active_stop_evs[chat_id] = global_stop_ev
     progress_q: asyncio.Queue = asyncio.Queue(maxsize=total_dorks * 2)
-    chunk_counters = {i: {"processed": 0, "total": len(chunks[i])} for i in range(actual_chunks)}
-    agg_raw = [0]
+
+    chunk_counters = {
+        i: {"processed": 0, "total": len(chunks[i])}
+        for i in range(actual_chunks)
+    }
+    agg_raw  = [0]
     agg_kept = [0]
-    last_edit = [0.0]
+    last_edit       = [0.0]
     total_processed = [0]
-    async def _status_updater():
+
+    async def _status_updater() -> None:
         while not global_stop_ev.is_set():
             drained = False
             while True:
                 try:
-                    ev = progress_q.get_nowait()
+                    ev  = progress_q.get_nowait()
                     cid = ev["chunk_id"]
                     chunk_counters[cid]["processed"] = ev["processed"]
-                    agg_raw[0] += ev["raw"]
+                    agg_raw[0]  += ev["raw"]
                     agg_kept[0] += ev["kept"]
                     total_processed[0] += 1
                     drained = True
                 except asyncio.QueueEmpty:
                     break
+
             if drained and time.time() - last_edit[0] > 4.0:
-                proc = total_processed[0]
-                pct = int(proc / total_dorks * 100) if total_dorks else 100
-                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                proc    = total_processed[0]
+                pct     = int(proc / total_dorks * 100) if total_dorks else 100
+                bar     = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 elapsed = int(time.time() - start_time)
-                eta = int((elapsed / proc) * (total_dorks - proc)) if proc else 0
-                cinfo = " | ".join(f"C{i}:{chunk_counters[i]['processed']}/{chunk_counters[i]['total']}" for i in range(actual_chunks))
+                eta     = int((elapsed / proc) * (total_dorks - proc)) if proc else 0
+                cinfo   = " | ".join(
+                    f"C{i}:{chunk_counters[i]['processed']}/{chunk_counters[i]['total']}"
+                    for i in range(actual_chunks)
+                )
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
@@ -1178,14 +1387,21 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                     last_edit[0] = time.time()
                 except Exception:
                     pass
+
             await asyncio.sleep(0.5)
-    async def _job_timeout():
+
+    async def _job_timeout() -> None:
         await asyncio.sleep(JOB_TIMEOUT)
         log.warning(f"[JOB][{chat_id}] Global timeout ({JOB_TIMEOUT}s) — aborting")
         global_stop_ev.set()
-    status_task = asyncio.create_task(_status_updater())
+
+    status_task  = asyncio.create_task(_status_updater())
     timeout_task = asyncio.create_task(_job_timeout())
+
+    # [CHANGED] Each chunk gets a randomly assigned proxy from the pool.
+    # When PROXY_ENABLED is False, _get_random_proxy returns None for all chunks.
     chunk_proxies = [_get_random_proxy() if not use_tor else None for _ in range(actual_chunks)]
+
     chunk_results = []
     try:
         chunk_tasks = []
@@ -1194,16 +1410,26 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
                 stagger = random.uniform(*CHUNK_STAGGER_DELAY)
                 log.info(f"[JOB][{chat_id}] Staggering chunk C{i} by {stagger:.1f}s")
                 await asyncio.sleep(stagger)
+
             task = asyncio.create_task(
                 run_chunk(
-                    chunk_id=i, dorks=chunk_dorks, engines=engines, pages=pages,
-                    max_res=max_res, use_tor=use_tor, min_score=min_score,
-                    workers_n=workers_n, progress_q=progress_q,
-                    global_stop_ev=global_stop_ev, proxy=chunk_proxies[i]
+                    chunk_id=i,
+                    dorks=chunk_dorks,
+                    engines=engines,
+                    pages=pages,
+                    max_res=max_res,
+                    use_tor=use_tor,
+                    min_score=min_score,
+                    workers_n=workers_n,
+                    progress_q=progress_q,
+                    global_stop_ev=global_stop_ev,
+                    proxy=chunk_proxies[i],
                 )
             )
             chunk_tasks.append(task)
+
         chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+
     except asyncio.CancelledError:
         log.info(f"[JOB][{chat_id}] Job cancelled")
         global_stop_ev.set()
@@ -1218,11 +1444,14 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         await asyncio.gather(timeout_task, status_task, return_exceptions=True)
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
-    seen_urls: set = set()
-    all_scored: list = []
-    total_raw = 0
-    total_degraded = 0
-    failed_chunks = 0
+
+    # ── Merge + global deduplication ─────────────────────────────────────────
+    seen_urls    : set  = set()
+    all_scored   : list = []
+    total_raw        = 0
+    total_degraded   = 0
+    failed_chunks    = 0
+
     for result in chunk_results:
         if isinstance(result, Exception):
             log.error(f"[JOB][{chat_id}] Chunk raised: {result}")
@@ -1232,16 +1461,25 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             if url not in seen_urls:
                 seen_urls.add(url)
                 all_scored.append((sc, url))
-        total_raw += result["raw_count"]
+        total_raw      += result["raw_count"]
         total_degraded += result["degraded_count"]
+
     all_scored.sort(reverse=True)
-    unique_cnt = len(all_scored)
-    elapsed = int(time.time() - start_time)
+    unique_cnt   = len(all_scored)
+    elapsed      = int(time.time() - start_time)
     success_rate = (total_raw - (total_raw - unique_cnt)) / max(total_raw, 1)
-    log.info(f"[JOB][{chat_id}] COMPLETE — dorks={total_dorks} raw={total_raw} unique={unique_cnt} degraded={total_degraded} failed_chunks={failed_chunks} elapsed={elapsed}s success_rate={success_rate:.1%}")
-    high = [(sc, u) for sc, u in all_scored if sc >= 70]
+
+    log.info(
+        f"[JOB][{chat_id}] COMPLETE — dorks={total_dorks} raw={total_raw} "
+        f"unique={unique_cnt} degraded={total_degraded} "
+        f"failed_chunks={failed_chunks} elapsed={elapsed}s "
+        f"success_rate={success_rate:.1%}"
+    )
+
+    high   = [(sc, u) for sc, u in all_scored if sc >= 70]
     medium = [(sc, u) for sc, u in all_scored if 40 <= sc < 70]
-    low = [(sc, u) for sc, u in all_scored if sc < 40]
+    low    = [(sc, u) for sc, u in all_scored if sc < 40]
+
     with open(tmp_path, "a", encoding="utf-8") as f:
         if high:
             f.write(f"# ── HIGH VALUE (score ≥70) — {len(high)} URLs\n")
@@ -1255,12 +1493,14 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             f.write(f"\n# ── LOW VALUE (score <40) — {len(low)} URLs\n")
             for sc, u in low:
                 f.write(f"{u}\n")
+
+    stopped_early = ""
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=status_msg.message_id,
             text=(
-                f"🏁 JOB COMPLETE!\n"
+                f"🏁 JOB COMPLETE!{stopped_early}\n"
                 f"{'━'*30}\n"
                 f"📋 Dorks    : {total_dorks}\n"
                 f"📄 Pages    : {pages_str}\n"
@@ -1276,6 +1516,7 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
         )
     except Exception:
         pass
+
     if all_scored:
         with open(tmp_path, "rb") as f:
             await context.bot.send_document(
@@ -1294,16 +1535,19 @@ async def run_dork_job(chat_id: int, dorks: list, context) -> None:
             "⚠️ No URLs matched the filter criteria.\n"
             "Try lowering /filter or adding more pages.",
         )
+
     try:
         os.unlink(tmp_path)
     except OSError:
         pass
 
-# ─── UI HELPERS (unchanged) ──────────────────────────────────────────────────
+
+# ─── UI HELPERS ──────────────────────────────────────────────────────────────
 def get_session(chat_id: int) -> dict:
     if chat_id not in user_sessions:
         user_sessions[chat_id] = dict(DEFAULT_SESSION)
     return user_sessions[chat_id]
+
 
 def page_keyboard(selected: list) -> InlineKeyboardMarkup:
     rows, row = [], []
@@ -1324,7 +1568,11 @@ def page_keyboard(selected: list) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(rows)
 
-# ─── COMMAND HANDLERS (unchanged) ────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── COMMAND HANDLERS ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📂 Bulk Upload",  callback_data="m_bulk"),
@@ -1336,20 +1584,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🧹 URL Cleaner",  callback_data="m_clean"),
          InlineKeyboardButton("📖 Help",         callback_data="m_help")],
     ]
+
+    # [CHANGED] Show proxy status with PROXY_ENABLED state
     if PROXY_ENABLED and _proxy_pool:
         proxy_status = f"🔄 {len(_proxy_pool)} proxies loaded (enabled)"
     elif not PROXY_ENABLED and _proxy_pool:
         proxy_status = f"⏸ {len(_proxy_pool)} proxies loaded (DISABLED)"
     else:
         proxy_status = "🔓 No proxy pool"
+
     await update.message.reply_text(
-        "🕷 DORK PARSER v18.2 — FIXED YAHOO & DDG\n"
+        "🕷 DORK PARSER v18.1 — STEALTH PARALLEL\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔒 Chrome110 TLS fingerprint spoofing\n"
         "⚡ Parallel page fetching per dork\n"
         "🔄 Full browser header rotation\n"
         "📈 Dynamic adaptive delay (fast/slow mode)\n"
-        "🔍 Bing + Yahoo + DuckDuckGo (JSON API)\n"
+        "🔍 Yahoo + DuckDuckGo engines\n"
         "🛡 SQL filter | Auto-slowdown | CAPTCHA hook\n"
         f"{proxy_status}\n\n"
         "📌 Core Commands:\n"
@@ -1358,12 +1609,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /pages      — pick pages 1-70\n"
         "  /workers N  — workers per chunk (1-20)\n"
         "  /chunks N   — parallel chunk count (1-8)\n"
-        "  /engine X   — bing|yahoo|duckduckgo|all\n"
+        "  /engine X   — yahoo|duckduckgo|all\n"
         "  /tor        — toggle Tor IP rotation\n"
         "  /filter N   — SQL score filter (0-100)\n"
         "  /stop       — stop & get partial results\n"
         "  Upload .txt — auto-detected (URLs or dorks)\n\n"
-        "🔄 Proxy Commands:\n"
+        "🔄 Proxy Commands:\n"                                   # [NEW]
         "  /addproxy <url>    — add proxy to pool\n"
         "  /removeproxy [i|url] — remove by index or URL\n"
         "  /proxylist         — view all proxies\n"
@@ -1371,6 +1622,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=InlineKeyboardMarkup(kb),
     )
+
 
 async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1381,7 +1633,7 @@ async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Job running! Use /stop first.")
         return
     dork = " ".join(context.args)
-    s = get_session(chat_id)
+    s    = get_session(chat_id)
     await update.message.reply_text(
         f"🔍 {dork[:60]}\n"
         f"📄 Pages: {', '.join(str(p) for p in s.get('pages', [1]))}"
@@ -1389,8 +1641,9 @@ async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], context))
 
+
 async def cmd_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat_id  = update.effective_chat.id
     selected = get_session(chat_id).get("pages", [1])
     await update.message.reply_text(
         f"📄 SELECT PAGES (1–70)\n"
@@ -1400,16 +1653,20 @@ async def cmd_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=page_keyboard(selected),
     )
 
+
 async def cmd_tor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global tor_enabled_users
     chat_id = update.effective_chat.id
-    sess = get_session(chat_id)
+    sess    = get_session(chat_id)
+
     if context.args and context.args[0].lower() in ("on", "off"):
         new_val = context.args[0].lower() == "on"
     else:
         new_val = not sess.get("tor", False)
-    old_val = sess.get("tor", False)
+
+    old_val     = sess.get("tor", False)
     sess["tor"] = new_val
+
     if new_val and not old_val:
         tor_enabled_users += 1
         if tor_enabled_users == 1:
@@ -1430,9 +1687,10 @@ async def cmd_tor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"Tor is already {'ON' if new_val else 'OFF'}.")
 
+
 async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    sess = get_session(chat_id)
+    sess    = get_session(chat_id)
     try:
         n = max(0, min(int(context.args[0]), 100))
         sess["min_score"] = n
@@ -1447,15 +1705,19 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🟨 0   = accept all"
         )
 
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    s = get_session(chat_id)
+    s       = get_session(chat_id)
+
+    # [CHANGED] Show full proxy status including PROXY_ENABLED flag
     if PROXY_ENABLED and _proxy_pool:
         proxy_line = f"🔄 Proxies  : {len(_proxy_pool)} in pool (enabled)\n"
     elif not PROXY_ENABLED and _proxy_pool:
         proxy_line = f"⏸ Proxies  : {len(_proxy_pool)} loaded but DISABLED (PROXY_ENABLED=false)\n"
     else:
         proxy_line = "🔓 Proxies  : none loaded\n"
+
     await update.message.reply_text(
         f"⚙️ SETTINGS\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1473,13 +1735,14 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/workers N | /chunks N | /maxres N\n"
         f"/engine X  | /filter N\n"
         f"/pages     | /tor\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"          # [NEW] proxy commands section
         f"🔄 Proxy Management:\n"
         f"/addproxy <url>      — add to pool\n"
         f"/removeproxy [i|url] — remove from pool\n"
         f"/proxylist           — view pool\n"
         f"/testproxy <url>     — test a proxy"
     )
+
 
 async def cmd_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1489,6 +1752,7 @@ async def cmd_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Workers per chunk: {n} (max {MAX_WORKERS_PER_CHUNK})")
     except Exception:
         await update.message.reply_text(f"Usage: /workers N (1-{MAX_WORKERS_PER_CHUNK})")
+
 
 async def cmd_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1503,6 +1767,7 @@ async def cmd_chunks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = get_session(chat_id).get("chunks", N_CHUNKS)
         await update.message.reply_text(f"Usage: /chunks N (1-8)\nCurrent: {cur}")
 
+
 async def cmd_maxres(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
@@ -1512,23 +1777,23 @@ async def cmd_maxres(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Usage: /maxres N (1-50)")
 
+
 async def cmd_engine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
         choice = context.args[0].lower()
         engine_map = {
-            "bing":        ["bing"],
             "yahoo":       ["yahoo"],
             "duckduckgo":  ["duckduckgo"],
             "ddg":         ["duckduckgo"],
             "all":         list(ENGINES),
-            "both":        ["bing", "yahoo"],
         }
         engines = engine_map.get(choice, list(ENGINES))
         get_session(chat_id)["engines"] = engines
         await update.message.reply_text(f"✅ Engines: {'+'.join(e.upper() for e in engines)}")
     except Exception:
-        await update.message.reply_text("Usage: /engine bing|yahoo|duckduckgo|ddg|all|both")
+        await update.message.reply_text("Usage: /engine yahoo|duckduckgo|ddg|all")
+
 
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1547,10 +1812,12 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Just upload your .txt file now ↑"
     )
 
+
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     stop_ev = active_stop_evs.get(chat_id)
-    job = active_jobs.get(chat_id)
+    job     = active_jobs.get(chat_id)
+
     if stop_ev and job and not job.done():
         stop_ev.set()
         await update.message.reply_text(
@@ -1566,13 +1833,29 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("💤 No active job to stop.")
 
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    job = active_jobs.get(chat_id)
-    await update.message.reply_text("⚡ Job RUNNING" if job and not job.done() else "💤 No active job")
+    job     = active_jobs.get(chat_id)
+    await update.message.reply_text(
+        "⚡ Job RUNNING" if job and not job.done() else "💤 No active job"
+    )
 
-# ─── PROXY MANAGEMENT COMMANDS (unchanged) ───────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── PROXY MANAGEMENT COMMANDS (NEW in v18.1) ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    [NEW] /addproxy <proxy_url>
+    Add a new proxy to the in-memory pool and persist to proxies.txt.
+
+    Accepted formats:
+      /addproxy socks5://user:pass@host:port
+      /addproxy http://host:port
+      /addproxy https://host:port
+    """
     if not context.args:
         await update.message.reply_text(
             "➕ ADD PROXY\n"
@@ -1585,7 +1868,10 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Current pool size: {len(_proxy_pool)}"
         )
         return
+
     proxy_url = context.args[0].strip()
+
+    # Validate format
     if not _validate_proxy_url(proxy_url):
         await update.message.reply_text(
             "❌ Invalid proxy format.\n\n"
@@ -1596,6 +1882,8 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: /addproxy socks5://127.0.0.1:1080"
         )
         return
+
+    # Check for duplicate
     if proxy_url in _proxy_pool:
         await update.message.reply_text(
             f"⚠️ Proxy already in pool.\n"
@@ -1603,11 +1891,15 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Pool size: {len(_proxy_pool)}"
         )
         return
+
+    # Add to in-memory pool and persist
     async with _proxy_pool_lock:
         _proxy_pool.append(proxy_url)
         _persist_proxies()
+
     info = _parse_proxy_info(proxy_url)
     log.info(f"[PROXY] Added: {proxy_url}")
+
     await update.message.reply_text(
         f"✅ PROXY ADDED\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1621,11 +1913,22 @@ async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Use /testproxy {proxy_url}\nto verify it works before using."
     )
 
+
 async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    [NEW] /removeproxy [index | proxy_url]
+    Remove a proxy from the pool by its 1-based index or exact URL.
+    With no argument, show the numbered list of current proxies.
+    """
+    # No argument → show numbered list for reference
     if not context.args:
         if not _proxy_pool:
-            await update.message.reply_text("📭 Proxy pool is empty.\nUse /addproxy <url> to add one.")
+            await update.message.reply_text(
+                "📭 Proxy pool is empty.\n"
+                "Use /addproxy <url> to add one."
+            )
             return
+
         lines = ["📋 PROXY POOL (use index to remove)\n━━━━━━━━━━━━━━━━━━━━━━"]
         for i, p in enumerate(_proxy_pool, start=1):
             info = _parse_proxy_info(p)
@@ -1634,12 +1937,18 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Usage: /removeproxy <index>  or  /removeproxy <url>")
         await update.message.reply_text("\n".join(lines))
         return
+
     arg = context.args[0].strip()
+
     async with _proxy_pool_lock:
+        # Try removal by integer index (1-based)
         try:
             idx = int(arg) - 1
             if idx < 0 or idx >= len(_proxy_pool):
-                await update.message.reply_text(f"❌ Index out of range. Pool has {len(_proxy_pool)} proxies (1–{len(_proxy_pool)}).")
+                await update.message.reply_text(
+                    f"❌ Index out of range.\n"
+                    f"Pool has {len(_proxy_pool)} {'proxy' if len(_proxy_pool)==1 else 'proxies'} (1–{len(_proxy_pool)})."
+                )
                 return
             removed = _proxy_pool.pop(idx)
             _persist_proxies()
@@ -1656,7 +1965,9 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         except ValueError:
-            pass
+            pass  # not an integer — try URL match
+
+        # Try removal by exact URL
         if arg in _proxy_pool:
             _proxy_pool.remove(arg)
             _persist_proxies()
@@ -1678,8 +1989,15 @@ async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"then remove by index number."
             )
 
+
 async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    [NEW] /proxylist
+    Display all proxies currently in the pool with their index, protocol, host,
+    and port. No status indicators or test results — just the list.
+    """
     if not _proxy_pool:
+        # [CHANGED] Show PROXY_ENABLED status even when pool is empty
         enabled_note = "" if PROXY_ENABLED else "\n⚠️ Note: PROXY_ENABLED=false — proxies are globally disabled."
         await update.message.reply_text(
             f"📭 Proxy pool is empty.{enabled_note}\n\n"
@@ -1688,6 +2006,7 @@ async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  /addproxy http://host:port"
         )
         return
+
     enabled_tag = "✅ ENABLED" if PROXY_ENABLED else "⏸ DISABLED (PROXY_ENABLED=false)"
     lines = [
         f"🔄 PROXY POOL — {len(_proxy_pool)} {'proxy' if len(_proxy_pool)==1 else 'proxies'} | {enabled_tag}",
@@ -1697,6 +2016,7 @@ async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = _parse_proxy_info(p)
         auth_tag = " 🔐" if info["auth"] else ""
         lines.append(f"{i:>2}. [{info['protocol']:7s}] {info['host']}:{info['port']}{auth_tag}")
+
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━",
         "/addproxy <url>   — add proxy",
@@ -1705,7 +2025,14 @@ async def cmd_proxylist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("\n".join(lines))
 
+
 async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    [NEW] /testproxy <proxy_url>
+    Manually test a proxy by making a lightweight GET request to httpbin.org/ip
+    (or ipinfo.io/ip as fallback). Reports success/failure, latency, and
+    the external IP the proxy presents. No automatic testing — manual only.
+    """
     if not context.args:
         await update.message.reply_text(
             "🧪 TEST PROXY\n"
@@ -1717,40 +2044,67 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Tests the proxy against httpbin.org/ip and reports latency + IP."
         )
         return
+
     proxy_url = context.args[0].strip()
+
     if not _validate_proxy_url(proxy_url):
-        await update.message.reply_text("❌ Invalid proxy format.\nExpected: http://host:port or socks5://host:port")
+        await update.message.reply_text(
+            "❌ Invalid proxy format.\n"
+            "Expected: http://host:port or socks5://host:port"
+        )
         return
+
     info = _parse_proxy_info(proxy_url)
     wait_msg = await update.message.reply_text(
         f"🧪 Testing proxy...\n"
         f"🔌 {info['protocol']} {info['host']}:{info['port']}\n"
         f"⏳ Connecting to httpbin.org/ip..."
     )
-    test_urls = ["https://httpbin.org/ip", "https://ipinfo.io/ip", "https://api.ipify.org"]
-    success = False
+
+    test_urls = [
+        "https://httpbin.org/ip",
+        "https://ipinfo.io/ip",
+        "https://api.ipify.org",
+    ]
+
+    success    = False
     latency_ms = None
-    ext_ip = None
-    error_msg = None
-    test_session = AsyncSession(impersonate="chrome110", verify=False, timeout=15, proxy=proxy_url)
+    ext_ip     = None
+    error_msg  = None
+
+    # [NEW] Create an isolated test session for this proxy only
+    test_session = AsyncSession(
+        impersonate="chrome110",
+        verify=False,
+        timeout=15,
+        proxy=proxy_url,
+    )
+
     try:
         for test_url in test_urls:
             try:
-                t0 = time.monotonic()
-                resp = await test_session.get(test_url, headers=_random_headers(), timeout=15)
+                t0   = time.monotonic()
+                resp = await test_session.get(
+                    test_url,
+                    headers=_random_headers(),
+                    timeout=15,
+                )
                 latency_ms = int((time.monotonic() - t0) * 1000)
+
                 if resp.status_code == 200:
                     raw_text = resp.text.strip()
+                    # Try to parse JSON from httpbin {"origin": "x.x.x.x"}
                     import json as _json
                     try:
-                        data = _json.loads(raw_text)
+                        data   = _json.loads(raw_text)
                         ext_ip = data.get("origin") or data.get("ip") or raw_text
                     except Exception:
-                        ext_ip = raw_text[:50]
+                        ext_ip = raw_text[:50]   # plain text IP from ipinfo/ipify
                     success = True
                     break
                 else:
                     error_msg = f"HTTP {resp.status_code} from {test_url}"
+
             except asyncio.TimeoutError:
                 error_msg = "Timeout (>15s)"
                 continue
@@ -1762,6 +2116,7 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
     finally:
         await test_session.close()
+
     if success:
         result_text = (
             f"✅ PROXY WORKING\n"
@@ -1773,6 +2128,7 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🌍 External IP: {ext_ip}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
         )
+        # Suggest adding if not already in pool
         if proxy_url not in _proxy_pool:
             result_text += "➕ Not in pool yet — use /addproxy to add it."
         else:
@@ -1789,12 +2145,21 @@ async def cmd_testproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Proxy unreachable or misconfigured.\n"
             f"Do not add this proxy to the pool."
         )
+
     try:
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=wait_msg.message_id, text=result_text)
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=wait_msg.message_id,
+            text=result_text,
+        )
     except Exception:
         await update.message.reply_text(result_text)
 
-# ─── FILE DETECTION (unchanged) ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ─── FILE DETECTION ──────────────────────────────────────────────────────────
 def _looks_like_url_list(lines: list) -> bool:
     non_empty = [l for l in lines if l.strip() and not l.startswith("#")]
     if not non_empty:
@@ -1802,9 +2167,11 @@ def _looks_like_url_list(lines: list) -> bool:
     url_lines = sum(1 for l in non_empty if l.strip().startswith("http"))
     return url_lines / len(non_empty) >= 0.5
 
+
+# ─── DOCUMENT & TEXT HANDLERS ────────────────────────────────────────────────
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    doc = update.message.document
+    doc     = update.message.document
     if chat_id in active_jobs and not active_jobs[chat_id].done():
         await update.message.reply_text("⚠️ Job running! Use /stop first.")
         return
@@ -1814,7 +2181,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📥 Reading file...")
     try:
         content = await (await context.bot.get_file(doc.file_id)).download_as_bytearray()
-        lines = content.decode("utf-8", errors="replace").splitlines()
+        lines   = content.decode("utf-8", errors="replace").splitlines()
+
         if _looks_like_url_list(lines):
             raw_urls = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
             if not raw_urls:
@@ -1824,7 +2192,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🧹 URL LIST detected — {len(raw_urls)} URLs\n"
                 f"🚀 Running URL Cleaner..."
             )
-            active_jobs[chat_id] = asyncio.create_task(run_url_clean_job(chat_id, raw_urls, context))
+            active_jobs[chat_id] = asyncio.create_task(
+                run_url_clean_job(chat_id, raw_urls, context)
+            )
         else:
             dorks = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
             if not dorks:
@@ -1841,9 +2211,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         await update.message.reply_text(f"❌ Error: {exc}")
 
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    lines = [l.strip() for l in update.message.text.splitlines() if l.strip() and not l.startswith("#")]
+    lines   = [
+        l.strip()
+        for l in update.message.text.splitlines()
+        if l.strip() and not l.startswith("#")
+    ]
     if len(lines) > 1:
         if chat_id in active_jobs and not active_jobs[chat_id].done():
             await update.message.reply_text("⚠️ Job running! /stop first.")
@@ -1858,14 +2233,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Use /dork <q> or upload .txt\n/pages | /tor | /filter N | /chunks N"
         )
 
+
+# ─── CALLBACK HANDLER ────────────────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    data = query.data
+    data    = query.data
     chat_id = query.message.chat_id
-    sess = get_session(chat_id)
+    sess    = get_session(chat_id)
+
     if data.startswith("pg_"):
-        cmd = data[3:]
+        cmd      = data[3:]
         selected = list(sess.get("pages", [1]))
         if cmd == "all":
             selected = list(range(1, 71))
@@ -1900,6 +2278,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
+
+    # [CHANGED] Updated inline help and settings to include proxy commands
     replies = {
         "m_bulk":     "📂 Upload a .txt file — URLs or dorks (auto-detected). No limit!",
         "m_single":   "🔍 /dork inurl:login.php?id=\nSet pages with /pages",
@@ -1921,7 +2301,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Pages:{','.join(str(p) for p in sess.get('pages', [1]))} "
             f"Engines:{'+'.join(e.upper() for e in sess.get('engines', ENGINES))} "
             f"Score≥{sess.get('min_score', 30)} Tor:{'ON' if sess.get('tor') else 'OFF'} "
-            f"Proxies:{len(_proxy_pool)}({'on' if PROXY_ENABLED else 'off'})"
+            f"Proxies:{len(_proxy_pool)}({'on' if PROXY_ENABLED else 'off'})"  # [NEW]
         ),
         "m_help": (
             "📖 COMMANDS\n━━━━━━━━━━━━━━━━━━━\n"
@@ -1931,14 +2311,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/chunks N         — parallel sessions (1-8)\n"
             "/workers N        — workers per chunk (1-20)\n"
             "/tor              — toggle Tor rotation\n"
-            "/engine X         — bing|yahoo|duckduckgo|all\n"
+            "/engine X         — yahoo|duckduckgo|all\n"
             "/filter N         — SQL score (0-100)\n"
             "/settings         — full config view\n"
             "/maxres N         — results/page (1-50)\n"
             "/stop             — stop & get partial results\n"
             "/status           — job status\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "🔄 Proxy:\n"
+            "🔄 Proxy:\n"                                                         # [NEW]
             "/addproxy <url>   — add proxy to pool\n"
             "/removeproxy [i]  — remove by index or URL\n"
             "/proxylist        — view all proxies\n"
@@ -1948,6 +2328,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📁 All results saved as a file — no chat spam."
         ),
     }
+
     if data == "m_pages":
         await query.message.reply_text(
             f"📄 SELECT PAGES (1–70)\n"
@@ -1958,37 +2339,62 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data in replies:
         await query.message.reply_text(replies[data])
 
-# ─── MAIN (unchanged) ────────────────────────────────────────────────────────
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
         log.critical("BOT_TOKEN not set! Add to .env file or environment.")
         raise SystemExit(1)
+
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # ── Core command registrations (unchanged) ──────────────────────────────
     for name, handler in [
-        ("start", cmd_start), ("help", cmd_settings), ("dork", cmd_dork), ("clean", cmd_clean),
-        ("pages", cmd_pages), ("tor", cmd_tor), ("filter", cmd_filter), ("settings", cmd_settings),
-        ("workers", cmd_workers), ("chunks", cmd_chunks), ("maxres", cmd_maxres), ("engine", cmd_engine),
-        ("stop", cmd_stop), ("status", cmd_status),
-        ("addproxy", cmd_addproxy), ("removeproxy", cmd_removeproxy), ("proxylist", cmd_proxylist),
-        ("testproxy", cmd_testproxy),
+        ("start",    cmd_start),
+        ("help",     cmd_settings),
+        ("dork",     cmd_dork),
+        ("clean",    cmd_clean),
+        ("pages",    cmd_pages),
+        ("tor",      cmd_tor),
+        ("filter",   cmd_filter),
+        ("settings", cmd_settings),
+        ("workers",  cmd_workers),
+        ("chunks",   cmd_chunks),
+        ("maxres",   cmd_maxres),
+        ("engine",   cmd_engine),
+        ("stop",     cmd_stop),
+        ("status",   cmd_status),
     ]:
         app.add_handler(CommandHandler(name, handler))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # ── [NEW] Proxy management command registrations ─────────────────────────
+    for name, handler in [
+        ("addproxy",    cmd_addproxy),
+        ("removeproxy", cmd_removeproxy),
+        ("proxylist",   cmd_proxylist),
+        ("testproxy",   cmd_testproxy),
+    ]:
+        app.add_handler(CommandHandler(name, handler))
+
+    app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
+
     async def _shutdown():
         stop_tor_rotation()
     app.shutdown_handler = _shutdown
+
     log.info("=" * 60)
-    log.info("  DORK PARSER v18.2 — FIXED YAHOO & DDG")
+    log.info("  DORK PARSER v18.1 — STEALTH PARALLEL ARCHITECTURE")
     log.info(f"  Chunks: {N_CHUNKS} | Workers/chunk: {WORKERS_PER_CHUNK}")
     log.info(f"  Delay: {MIN_DELAY}–{MAX_DELAY}s | Fast: {FAST_MIN_DELAY}–{FAST_MAX_DELAY}s")
     log.info(f"  TLS: Chrome110 fingerprint")
     log.info(f"  Proxies: {len(_proxy_pool)} loaded | PROXY_ENABLED={PROXY_ENABLED}")
     log.info(f"  Engines: {', '.join(ENGINES)}")
-    log.info(f"  Debug HTML: {'ON' if DEBUG_HTML else 'OFF'}")
+    log.info(f"  New commands: /addproxy /removeproxy /proxylist /testproxy")
     log.info("=" * 60)
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
