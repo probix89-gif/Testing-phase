@@ -43,7 +43,7 @@ from telegram.ext import (
 load_dotenv()
 
 # Validate required variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("8661725916:AAHBm0_WMPGc_qqk5WuoAO65uuEkWr_VLq0")
 if not TELEGRAM_TOKEN or len(TELEGRAM_TOKEN) < 10:
     raise SystemExit("FATAL: TELEGRAM_TOKEN not set or invalid in .env")
 
