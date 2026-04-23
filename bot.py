@@ -6,16 +6,16 @@ No real money trading – only educational alerts.
 """
 
 import asyncio
-import hashlib
+import os
+import sys
 import json
 import logging
-import os
 import signal
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import wraps
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -29,7 +29,6 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    BaseHandler,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -37,22 +36,42 @@ from telegram.ext import (
     filters,
 )
 
-# -------------------------------
-# 1. Environment & Configuration
-# -------------------------------
-load_dotenv()
+# --------------------------------------------
+# Robust .env Loading
+# --------------------------------------------
+# Try to load from the script's directory first, then from current working directory.
+env_path_script = Path(__file__).resolve().parent / ".env"
+env_path_cwd = Path.cwd() / ".env"
+loaded = False
+for env_path in (env_path_script, env_path_cwd):
+    if env_path.exists():
+        load_dotenv(dotenv_path=str(env_path))
+        loaded = True
+        break
 
-# Validate required variables
-TELEGRAM_TOKEN = os.getenv("8661725916:AAHBm0_WMPGc_qqk5WuoAO65uuEkWr_VLq0")
-if not TELEGRAM_TOKEN or len(TELEGRAM_TOKEN) < 10:
-    raise SystemExit("FATAL: TELEGRAM_TOKEN not set or invalid in .env")
+if not loaded:
+    print(f"Warning: .env file not found at {env_path_script} or {env_path_cwd}")
 
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))  # Telegram numeric ID
+# --------------------------------------------
+# Environment Variables Validation
+# --------------------------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN or len(TELEGRAM_TOKEN.strip()) < 10:
+    print(f"FATAL: TELEGRAM_TOKEN not set or invalid. Please put your token into a .env file like:")
+    print(f"    TELEGRAM_TOKEN=123456:ABC-DEF1234ghikl")
+    print(f"Expected locations: {env_path_script} or {env_path_cwd}")
+    sys.exit(1)
+
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 OLYMP_SSID = os.getenv("OLYMP_SSID", "")
 DEMO_MODE = os.getenv("DEMO_MODE", "1") == "1"
 DB_PATH = os.getenv("DB_PATH", "ultimate_bot.db")
 LOG_FILE = os.getenv("LOG_FILE", "bot.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Validate ADMIN_USER_ID if set
+if ADMIN_USER_ID == 0:
+    print("Warning: ADMIN_USER_ID not set. Admin functions won't work without a valid Telegram user ID.")
 
 # Structured logging
 logging.basicConfig(
@@ -61,13 +80,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE)],
 )
 logger = logging.getLogger("EDU_BOT")
-
-# Prevent token from being logged
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # -------------------------------
-# 2. Configuration Dataclass
+# Configuration Dataclass
 # -------------------------------
 @dataclass
 class AppConfig:
@@ -80,19 +97,18 @@ class AppConfig:
     xgboost_weight: float = 0.2
     lstm_weight: float = 0.15
     ensemble_threshold: float = 0.6
-    risk_per_trade: float = 0.0        # educational – no real trades
+    risk_per_trade: float = 0.0
     enable_lstm: bool = True
     enable_xgboost: bool = True
-    # The admin user is loaded from env, not from DB
     admin_user_id: int = ADMIN_USER_ID
 
 config = AppConfig()
 
 
 # -------------------------------
-# 3. Database Layer (SQLite)
+# Database Layer (SQLite)
 # -------------------------------
-db_pool = None  # will be set in init_db
+db_pool = None
 
 async def init_db():
     global db_pool
@@ -132,9 +148,8 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_users_active ON users(active);
     """)
     await db_pool.commit()
-    logger.info("Database ready.")
+    logger.info("Database initialized.")
 
-# Repository functions using the pool
 async def db_execute(query: str, params=None):
     async with db_pool.execute(query, params or ()) as cursor:
         return await cursor.fetchall()
@@ -145,7 +160,7 @@ async def db_execute_commit(query: str, params=None):
 
 
 # -------------------------------
-# 4. User & Role Management
+# User & Role Management
 # -------------------------------
 class UserManager:
     @staticmethod
@@ -178,10 +193,9 @@ class UserManager:
 
 
 # -------------------------------
-# 5. Middleware (Auth, Rate Limiting, Audit)
+# Rate Limiter & Auth Middleware
 # -------------------------------
 class RateLimiter:
-    """Simple in-memory per-user rate limit."""
     def __init__(self, max_calls: int = 10, window: int = 60):
         self.max_calls = max_calls
         self.window = window
@@ -200,11 +214,10 @@ class RateLimiter:
 rate_limiter = RateLimiter()
 
 async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Middleware that runs before every handler."""
     user = update.effective_user
     if not user:
         return
-    # Skip rate limit for admin
+    # Admin bypasses rate limit and auth check
     if user.id != config.admin_user_id:
         if not await rate_limiter.check(user.id):
             await context.bot.send_message(user.id, "⏳ Please slow down.")
@@ -212,7 +225,6 @@ async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await UserManager.is_authorized(user.id):
             await context.bot.send_message(user.id, "❌ You are not authorised.")
             raise SystemExit()
-
     # Audit log
     if update.message:
         logger.info(f"AUDIT user={user.id} ({user.username}) cmd={update.message.text}")
@@ -220,7 +232,6 @@ async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"AUDIT user={user.id} ({user.username}) callback={update.callback_query.data}")
 
 
-# Decorator for admin-only commands
 def admin_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +243,7 @@ def admin_only(func):
 
 
 # -------------------------------
-# 6. Data Providers
+# Data Providers
 # -------------------------------
 class DataProvider:
     async def start(self): raise NotImplementedError
@@ -241,7 +252,6 @@ class DataProvider:
         raise NotImplementedError
 
 class SimulatedProvider(DataProvider):
-    """Synthetic OHLC using geometric Brownian motion – educational."""
     def __init__(self, symbols: List[str] = None):
         self.symbols = symbols or config.symbols
         self.candles: Dict[str, pd.DataFrame] = {}
@@ -290,13 +300,9 @@ class SimulatedProvider(DataProvider):
 
 
 class OlympTradeProvider(DataProvider):
-    """
-    Real Olymp Trade WebSocket data. Requires valid OLYMP_SSID.
-    Aggregates ticks into OHLC candles.
-    """
     def __init__(self, ssid: str):
         self.ssid = ssid
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.ws = None
         self.candles: Dict[str, pd.DataFrame] = {}
         self._ticks_queue = asyncio.Queue()
         self._buffer: Dict[str, List[Dict]] = {}
@@ -307,7 +313,7 @@ class OlympTradeProvider(DataProvider):
 
     async def start(self):
         if not self.ssid:
-            logger.error("OLYMP_SSID not set. Cannot connect.")
+            logger.error("OLYMP_SSID not set.")
             return
         self._running = True
         self._ws_task = asyncio.create_task(self._ws_connect())
@@ -329,11 +335,9 @@ class OlympTradeProvider(DataProvider):
             try:
                 async with websockets.connect("wss://ws.olymptrade.com/ws2") as ws:
                     self.ws = ws
-                    # Auth
                     await ws.send(json.dumps({"msg": "authorize", "ssid": self.ssid, "demo": True}))
                     resp = await ws.recv()
                     logger.info(f"Olymp auth response: {resp}")
-                    # Subscribe
                     for sym in config.symbols:
                         await ws.send(json.dumps({"msg": "subscribe_ticks", "symbols": [sym]}))
                     async for msg in ws:
@@ -358,24 +362,20 @@ class OlympTradeProvider(DataProvider):
                 continue
             price = tick["q"]
             ts = datetime.utcnow()
-            # Buffer tick
             if symbol not in self._buffer:
                 self._buffer[symbol] = []
             self._buffer[symbol].append({"price": price, "ts": ts})
-            # Aggregate per timeframe
             for tf in config.timeframes:
                 key = f"{symbol}_{tf}"
                 slot = ts.replace(second=0, microsecond=0) - timedelta(minutes=ts.minute % tf)
                 if key not in self._last_aggregation or self._last_aggregation[key] != slot:
-                    # Close previous candle and create new
                     buffer = self._buffer.get(symbol, [])
                     if buffer:
                         prices = [b["price"] for b in buffer]
                         o, h, l, c = prices[0], max(prices), min(prices), prices[-1]
-                        vol = len(buffer)
                         new = pd.DataFrame([{
                             "open": o, "high": h, "low": l, "close": c,
-                            "volume": vol, "timestamp": self._last_aggregation.get(key, slot)
+                            "volume": len(buffer), "timestamp": self._last_aggregation.get(key, slot)
                         }])
                         if key in self.candles:
                             self.candles[key] = pd.concat([self.candles[key], new], ignore_index=True).iloc[-500:]
@@ -397,13 +397,12 @@ def get_provider() -> DataProvider:
 
 
 # -------------------------------
-# 7. AI Engine – Indicators & Ensemble
+# AI Engine
 # -------------------------------
 class AIEngine:
     def __init__(self):
         self.xgb_model = None
         self.lstm_model = None
-        # Try loading pre-trained models from disk (educational)
         if os.path.exists("xgb_model.json"):
             try:
                 import xgboost as xgb
@@ -421,7 +420,6 @@ class AIEngine:
                 logger.warning(f"Cannot load LSTM: {e}")
 
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add all technical indicators used for signals and explainability."""
         if df.empty or len(df) < 2:
             return df
         df = df.copy()
@@ -444,36 +442,28 @@ class AIEngine:
         return df
 
     def indicator_scores(self, df: pd.DataFrame) -> Dict[str, float]:
-        """Score each indicator between -1 and +1."""
         last = df.iloc[-1]
         scores = {}
-        # RSI
         rsi = last.get("rsi", 50)
         if pd.notna(rsi):
             if rsi < 30: scores["rsi"] = 1.0
             elif rsi > 70: scores["rsi"] = -1.0
             else: scores["rsi"] = (50 - rsi) / 20
-        # MACD
         if pd.notna(last.get("macd")) and pd.notna(last.get("macd_signal")):
             scores["macd"] = 1.0 if last["macd"] > last["macd_signal"] else -1.0
-        # Bollinger
         if pd.notna(last.get("bb_low")):
             if last["close"] <= last["bb_low"]: scores["bb"] = 1.0
             elif last["close"] >= last["bb_high"]: scores["bb"] = -1.0
             else: scores["bb"] = 0.0
-        # Stochastic
         if pd.notna(last.get("stoch_k")) and pd.notna(last.get("stoch_d")):
             if last["stoch_k"] < 20 and last["stoch_d"] < 20: scores["stoch"] = 1.0
             elif last["stoch_k"] > 80 and last["stoch_d"] > 80: scores["stoch"] = -1.0
             else: scores["stoch"] = 0.0
-        # MA cross
         if pd.notna(last.get("ema_9")) and pd.notna(last.get("ema_21")):
             scores["ma_cross"] = 1.0 if last["ema_9"] > last["ema_21"] else -1.0
-        # ADX (only gives direction weight)
         adx = last.get("adx", 0)
         if pd.notna(adx):
-            scores["adx"] = min(1.0, (adx - 15) / 30)  # scaling
-        # ATR and Volume not directional, we skip for scores here.
+            scores["adx"] = min(1.0, (adx - 15) / 30)
         return scores
 
     def xgboost_predict(self, df: pd.DataFrame) -> Optional[float]:
@@ -484,17 +474,15 @@ class AIEngine:
             prob = self.xgb_model.predict_proba(features)[0][1]
             return (prob - 0.5) * 2
         except Exception as e:
-            logger.error(f"XGB predict error: {e}")
+            logger.error(f"XGB error: {e}")
             return None
 
     def _generate_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df = self.compute_indicators(df)
-        # Add returns etc.
         df['returns'] = df['close'].pct_change()
         df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
         df = df.fillna(0)
-        # Use only known features; in a real model we'd have a predefined list.
         return df.drop(columns=['open','high','low','close','volume','timestamp'], errors='ignore')
 
     def lstm_predict(self, df: pd.DataFrame) -> Optional[float]:
@@ -507,15 +495,13 @@ class AIEngine:
             prob = self.lstm_model.predict(X, verbose=0)[0][0]
             return (prob - 0.5) * 2
         except Exception as e:
-            logger.error(f"LSTM predict error: {e}")
+            logger.error(f"LSTM error: {e}")
             return None
 
     def generate_educational_signal(self, symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-        """Returns None or a dict with direction, confidence, and educational reasons."""
         if df is None or len(df) < 30:
             return None
         ind_scores = self.indicator_scores(df)
-        # Build explanation
         reasons = []
         last = df.iloc[-1]
         if ind_scores.get("rsi", 0) > 0.5: reasons.append(f"RSI oversold ({last.get('rsi',50):.1f})")
@@ -524,24 +510,19 @@ class AIEngine:
         if ind_scores.get("macd", 0) < 0: reasons.append("MACD bearish crossover")
         if ind_scores.get("bb", 0) > 0: reasons.append("Price at lower Bollinger band")
         if ind_scores.get("bb", 0) < 0: reasons.append("Price at upper Bollinger band")
-        if ind_scores.get("ma_cross", 0) > 0: reasons.append("EMA 9 > EMA 21 (short-term uptrend)")
-        if ind_scores.get("ma_cross", 0) < 0: reasons.append("EMA 9 < EMA 21 (short-term downtrend)")
+        if ind_scores.get("ma_cross", 0) > 0: reasons.append("EMA 9 > EMA 21 (uptrend)")
+        if ind_scores.get("ma_cross", 0) < 0: reasons.append("EMA 9 < EMA 21 (downtrend)")
         adx = last.get("adx", 0)
         if pd.notna(adx) and adx > 25:
-            reasons.append(f"ADX {adx:.1f} indicates a trending market")
+            reasons.append(f"ADX {adx:.1f} indicates trending market")
         else:
             reasons.append("ADX indicates range-bound market")
-
-        # Weighted technical score
         tech_score = sum(ind_scores.get(k,0)*config.indicator_weights.get(k,0) for k in config.indicator_weights)
-        # Add model predictions if available
         xgb_s = self.xgboost_predict(df) if config.enable_xgboost else None
         lstm_s = self.lstm_predict(df) if config.enable_lstm else None
         final_score = tech_score
-        if xgb_s is not None:
-            final_score += config.xgboost_weight * xgb_s
-        if lstm_s is not None:
-            final_score += config.lstm_weight * lstm_s
+        if xgb_s is not None: final_score += config.xgboost_weight * xgb_s
+        if lstm_s is not None: final_score += config.lstm_weight * lstm_s
         direction = None
         if final_score > config.ensemble_threshold:
             direction = "BUY"
@@ -549,7 +530,6 @@ class AIEngine:
             direction = "SELL"
         if direction is None:
             return None
-
         return {
             "symbol": symbol,
             "direction": direction,
@@ -561,23 +541,21 @@ class AIEngine:
 
 
 # -------------------------------
-# 8. Telegram Bot Handlers
+# Telegram Bot Handlers
 # -------------------------------
-def build_main_menu(user_role: str) -> InlineKeyboardMarkup:
+def build_main_menu(role: str) -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Status", callback_data="status"),
          InlineKeyboardButton("📈 Dashboard", callback_data="dashboard")],
-        [InlineKeyboardButton("📜 Signal History", callback_data="history"),
+        [InlineKeyboardButton("📜 History", callback_data="history"),
          InlineKeyboardButton("⚙ Settings", callback_data="settings")],
     ]
-    if user_role == "admin":
+    if role == "admin":
         keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin")])
     return InlineKeyboardMarkup(keyboard)
 
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Auto-register user (first contact)
     await UserManager.add_user(user.id, user.username or "unknown")
     if user.id == config.admin_user_id:
         await UserManager.add_user(user.id, user.username or "admin", "admin")
@@ -588,14 +566,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_main_menu(role)
     )
 
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     user_id = query.from_user.id
     role = await UserManager.get_role(user_id)
-
     if data == "status":
         msg = (
             f"📊 *Bot Status*\n"
@@ -604,14 +580,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Ensemble threshold: {config.ensemble_threshold}\n"
             f"XGBoost: {'✅' if config.enable_xgboost else '❌'}  LSTM: {'✅' if config.enable_lstm else '❌'}"
         )
-        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
     elif data == "dashboard":
-        # Simplified dashboard
         rows = await db_execute("SELECT COUNT(*), SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) FROM trades")
         total, wins = rows[0] if rows else (0,0)
         winrate = (wins/total*100) if total else 0
         msg = f"📈 *Dashboard*\nTotal signals: {total}\nWin rate: {winrate:.1f}%\n⚠️ Educational only"
-        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
     elif data == "history":
         rows = await db_execute("SELECT * FROM signals ORDER BY id DESC LIMIT 5")
         if rows:
@@ -619,18 +592,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = "📜 *Recent Signals*\n" + "\n".join(lines)
         else:
             msg = "No signals yet."
-        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
     elif data == "settings":
-        await query.edit_message_text("Settings module under construction.", reply_markup=build_main_menu(role))
+        msg = "Settings module under construction."
     elif data == "admin" and role == "admin":
-        await admin_panel(update, context)
+        await admin_panel_callback(update, context)
+        return
     else:
-        await query.edit_message_text("Unknown action.", reply_markup=build_main_menu(role))
-
+        msg = "Unknown action."
+    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=build_main_menu(role))
 
 @admin_only
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kbd = [
         [InlineKeyboardButton("➕ Add User", callback_data="add_user"),
          InlineKeyboardButton("➖ Remove User", callback_data="rem_user")],
@@ -638,10 +610,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
         [InlineKeyboardButton("🛑 Shutdown", callback_data="shutdown")],
     ]
-    await (query.edit_message_text if query else update.message.reply_text)(
-        "👑 Admin Panel", reply_markup=InlineKeyboardMarkup(kbd)
-    )
-
+    await update.callback_query.edit_message_text("👑 Admin Panel", reply_markup=InlineKeyboardMarkup(kbd))
 
 async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != config.admin_user_id:
@@ -650,10 +619,7 @@ async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /adduser @username")
         return
     username = context.args[0].lstrip("@")
-    # Note: Telegram doesn't give user_id by username via bot API easily.
-    # This is a simplified placeholder – the real approach requires user to /start first.
-    await update.message.reply_text(f"User @{username} added when they /start.")
-
+    await update.message.reply_text(f"User @{username} will be added when they /start.")
 
 @admin_only
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -670,7 +636,6 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
     await update.message.reply_text(f"Broadcast sent to {success}/{len(users)} users.")
-
 
 @admin_only
 async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -691,10 +656,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # -------------------------------
-# 9. Background Signal Loop
+# Background Signal Loop
 # -------------------------------
 async def signal_loop(provider: DataProvider, engine: AIEngine, bot_app):
-    """Continuously generate and broadcast educational signals."""
     while True:
         try:
             for sym in config.symbols:
@@ -703,13 +667,11 @@ async def signal_loop(provider: DataProvider, engine: AIEngine, bot_app):
                     continue
                 signal = engine.generate_educational_signal(sym, df)
                 if signal:
-                    # Save to DB
                     await db_execute_commit(
                         "INSERT INTO signals (symbol, direction, entry, confidence, timestamp, reasons) VALUES (?,?,?,?,?,?)",
                         (sym, signal["direction"], signal["entry"], signal["confidence"],
                          signal["timestamp"], "; ".join(signal["reasons"]))
                     )
-                    # Build educational message
                     reasons_text = "\n".join(f"• {r}" for r in signal["reasons"])
                     msg = (
                         f"🔎 *Educational Alert – {sym}*\n"
@@ -719,7 +681,6 @@ async def signal_loop(provider: DataProvider, engine: AIEngine, bot_app):
                         f"Reasons:\n{reasons_text}\n\n"
                         f"⚠️ *This is not financial advice.* Trading involves risk."
                     )
-                    # Send to all authorised users
                     for uid in await UserManager.all_active_users():
                         try:
                             await bot_app.bot.send_message(uid, msg, parse_mode=ParseMode.MARKDOWN)
@@ -732,36 +693,23 @@ async def signal_loop(provider: DataProvider, engine: AIEngine, bot_app):
 
 
 # -------------------------------
-# 10. Main Entry Point
+# Main Entry Point
 # -------------------------------
 async def main():
-    # Init DB
     await init_db()
-
-    # Create provider
     provider = get_provider()
     await provider.start()
-
-    # AI Engine
     engine = AIEngine()
-
-    # Build Telegram application with middleware
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    # Register custom middleware as first handler
     app.add_handler(MessageHandler(filters.ALL, auth_middleware), group=-1)
-
-    # Register commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("adduser", add_user_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("shutdown", shutdown_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(error_handler)
-
-    # Start background signal loop
     signal_task = asyncio.create_task(signal_loop(provider, engine, app))
 
-    # Graceful shutdown
     async def shutdown_hook():
         logger.info("Shutting down...")
         signal_task.cancel()
@@ -774,7 +722,6 @@ async def main():
         try:
             loop.add_signal_handler(sig, lambda: asyncio.ensure_future(shutdown_hook()))
         except NotImplementedError:
-            # Windows doesn't support add_signal_handler
             pass
 
     logger.info("Bot starting...")
