@@ -4,8 +4,8 @@ Educational Market Analysis Bot – PROBIX_XD Admin Edition v2.0
 Single-file, fully async, production-grade.
 No real money trading – educational alerts only.
 
-FIXED: Polling startup (double-start cancelled the updater)
-       Bot now responds to /start for all users, including secondary admins.
+FIXED: Startup now uses Application.start() + asyncio.Event instead of
+       Application.run_polling() to avoid nested event-loop errors.
 """
 
 import asyncio
@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import logging
+import signal as signal_module
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -87,8 +88,8 @@ class AppConfig:
     enable_lstm: bool = True
     enable_xgboost: bool = True
     admin_user_id: int = ADMIN_USER_ID
-    signal_interval: int = 60       # seconds between signal loop iterations
-    signal_cooldown: int = 300      # seconds before same symbol signal repeats
+    signal_interval: int = 60        # seconds between signal loop iterations
+    signal_cooldown: int = 300       # seconds before same symbol signal repeats
 
 config = AppConfig()
 
@@ -337,7 +338,7 @@ class OlympTradeProvider(DataProvider):
             logger.error("OLYMP_SSID not set.")
             return
         self._running = True
-        self._ws_task  = asyncio.create_task(self._ws_connect())
+        self._ws_task = asyncio.create_task(self._ws_connect())
         self._agg_task = asyncio.create_task(self._aggregate())
         logger.info("OlympTradeProvider started")
 
@@ -383,7 +384,7 @@ class OlympTradeProvider(DataProvider):
             ts = datetime.utcnow()
             self._buffer.setdefault(sym, []).append({"price": price, "ts": ts})
             for tf in config.timeframes:
-                key  = f"{sym}_{tf}"
+                key = f"{sym}_{tf}"
                 slot = ts.replace(second=0, microsecond=0) - timedelta(minutes=ts.minute % tf)
                 if self._last_agg.get(key) != slot:
                     buf = self._buffer.get(sym, [])
@@ -405,7 +406,7 @@ class OlympTradeProvider(DataProvider):
 
     async def get_candle(self, symbol: str, timeframe: int, bars: int = 100) -> pd.DataFrame:
         key = f"{symbol}_{timeframe}"
-        df  = self.candles.get(key, pd.DataFrame())
+        df = self.candles.get(key, pd.DataFrame())
         return df.tail(bars).copy() if not df.empty else pd.DataFrame()
 
 def get_provider() -> DataProvider:
@@ -833,9 +834,11 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggers a graceful shutdown via the shutdown_event."""
     await update.message.reply_text("🛑 Shutting down bot…")
     logger.info("Shutdown triggered by admin.")
-    await context.application.stop()
+    # Signal the main loop to stop
+    context.bot_data["shutdown_event"].set()
 
 # ── Callback / Inline Button Handlers ────
 _admin_state: Dict[int, Dict] = {}
@@ -1001,7 +1004,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "shutdown" and role == "admin":
         await query.edit_message_text("🛑 Shutting down…")
         logger.info("Shutdown via admin panel.")
-        await context.application.stop()
+        # Signal the main loop to stop
+        context.bot_data["shutdown_event"].set()
         return
 
     if data in ("add_user", "rem_user", "broadcast") and role == "admin":
@@ -1145,6 +1149,10 @@ async def main():
     app.bot_data["provider"] = provider
     app.bot_data["engine"] = engine
 
+    # Create an event that signals shutdown
+    shutdown_event = asyncio.Event()
+    app.bot_data["shutdown_event"] = shutdown_event
+
     # Middleware
     app.add_handler(MessageHandler(filters.ALL, auth_middleware), group=-1)
 
@@ -1171,25 +1179,31 @@ async def main():
 
     app.add_error_handler(error_handler)
 
-    # Start background signal loop
+    # Manual startup: we are already inside an event loop
+    await app.initialize()
+    await app.start()                     # starts polling + bot
     signal_task = asyncio.create_task(signal_loop(provider, engine, app))
 
-    logger.info(f"Bot starting | Admin: {ADMIN_USER_ID} | Secondary admins: {SECONDARY_ADMIN_USERNAMES}")
+    logger.info(f"Bot started | Admin: {ADMIN_USER_ID} | Secondary admins: {SECONDARY_ADMIN_USERNAMES}")
 
+    # Wait until shutdown is signalled
+    await shutdown_event.wait()
+    logger.info("Shutdown signal received, cleaning up…")
+
+    # Begin graceful shutdown
+    signal_task.cancel()
     try:
-        # This blocks until a stop signal is received (e.g. /shutdown, Ctrl+C)
-        await app.run_polling(drop_pending_updates=True)
-    finally:
-        # Cleanup
-        signal_task.cancel()
-        try:
-            await signal_task
-        except asyncio.CancelledError:
-            pass
-        await provider.stop()
-        await app.shutdown()
-        logger.info("Bot shut down cleanly.")
+        await signal_task
+    except asyncio.CancelledError:
+        pass
+
+    await app.stop()
+    await app.shutdown()
+    await provider.stop()
+    logger.info("Bot shut down cleanly.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
-                    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Interrupted by user")
