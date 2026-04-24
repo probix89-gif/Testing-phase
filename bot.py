@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Educational Market Analysis Bot – PROBIX_XD Admin Edition v2.0
+Educational Market Analysis Bot – PROBIX_XD Admin Edition v3.0
 Single-file, fully async, production-grade.
 No real money trading – educational alerts only.
 
-FIXED: Startup now uses Application.start() + asyncio.Event instead of
-       Application.run_polling() to avoid nested event-loop errors.
+Fully redesigned for reliable startup and shutdown.
 """
 
 import asyncio
@@ -13,7 +12,6 @@ import os
 import sys
 import json
 import logging
-import signal as signal_module
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -281,7 +279,7 @@ class SimulatedProvider(DataProvider):
 
     async def start(self):
         self._running = True
-        self._task = asyncio.create_task(self._simulate())
+        self._task = asyncio.ensure_future(self._simulate())
         logger.info("SimulatedProvider started")
 
     async def stop(self):
@@ -338,8 +336,8 @@ class OlympTradeProvider(DataProvider):
             logger.error("OLYMP_SSID not set.")
             return
         self._running = True
-        self._ws_task = asyncio.create_task(self._ws_connect())
-        self._agg_task = asyncio.create_task(self._aggregate())
+        self._ws_task = asyncio.ensure_future(self._ws_connect())
+        self._agg_task = asyncio.ensure_future(self._aggregate())
         logger.info("OlympTradeProvider started")
 
     async def stop(self):
@@ -414,7 +412,7 @@ def get_provider() -> DataProvider:
         return SimulatedProvider()
     return OlympTradeProvider(OLYMP_SSID)
 
-# ── AI Engine ────────────────────────────
+# ── AI Engine (unchanged, but included for completeness) ──
 class AIEngine:
     def __init__(self):
         self.xgb_model = None
@@ -834,11 +832,10 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggers a graceful shutdown via the shutdown_event."""
     await update.message.reply_text("🛑 Shutting down bot…")
     logger.info("Shutdown triggered by admin.")
-    # Signal the main loop to stop
-    context.bot_data["shutdown_event"].set()
+    # This stops the run_polling() loop cleanly
+    context.application.stop_running()
 
 # ── Callback / Inline Button Handlers ────
 _admin_state: Dict[int, Dict] = {}
@@ -945,6 +942,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "toggle_xgb" and role == "admin":
         config.enable_xgboost = not config.enable_xgboost
         await query.answer(f"XGBoost {'enabled' if config.enable_xgboost else 'disabled'}")
+        # Re-route to settings to refresh view
         update.callback_query.data = "settings"
         await button_handler(update, context)
         return
@@ -1004,8 +1002,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "shutdown" and role == "admin":
         await query.edit_message_text("🛑 Shutting down…")
         logger.info("Shutdown via admin panel.")
-        # Signal the main loop to stop
-        context.bot_data["shutdown_event"].set()
+        context.application.stop_running()
         return
 
     if data in ("add_user", "rem_user", "broadcast") and role == "admin":
@@ -1138,20 +1135,40 @@ async def signal_loop(provider: DataProvider, engine: AIEngine, app: Application
             logger.error(f"Signal loop error: {e}", exc_info=True)
         await asyncio.sleep(config.signal_interval)
 
-# ── Main ────────────────────────────────
-async def main():
+# ── Application Lifecycle Hooks ─────────
+async def post_init(app: Application):
+    """Called after initialization, before polling starts."""
+    # Initialize DB (must be done first)
     await init_db()
+
+    # Start data provider
     provider = get_provider()
     await provider.start()
-    engine = AIEngine()
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.bot_data["provider"] = provider
+
+    # Build AI engine
+    engine = AIEngine()
     app.bot_data["engine"] = engine
 
-    # Create an event that signals shutdown
-    shutdown_event = asyncio.Event()
-    app.bot_data["shutdown_event"] = shutdown_event
+    # Launch background signal loop as an Application task (auto-cancelled on shutdown)
+    app.create_task(signal_loop(provider, engine, app))
+    logger.info("Post-init complete: provider started, signal loop launched.")
+
+async def post_shutdown(app: Application):
+    """Called after Application.stop(), cleanup resources."""
+    provider: Optional[DataProvider] = app.bot_data.get("provider")
+    if provider:
+        await provider.stop()
+    logger.info("Post-shutdown: provider stopped.")
+
+# ── Main Entry Point ────────────────────
+def main():
+    # Build the Application (no asyncio.run here)
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Register lifecycle hooks
+    app.post_init = post_init
+    app.post_shutdown = post_shutdown
 
     # Middleware
     app.add_handler(MessageHandler(filters.ALL, auth_middleware), group=-1)
@@ -1179,31 +1196,10 @@ async def main():
 
     app.add_error_handler(error_handler)
 
-    # Manual startup: we are already inside an event loop
-    await app.initialize()
-    await app.start()                     # starts polling + bot
-    signal_task = asyncio.create_task(signal_loop(provider, engine, app))
-
-    logger.info(f"Bot started | Admin: {ADMIN_USER_ID} | Secondary admins: {SECONDARY_ADMIN_USERNAMES}")
-
-    # Wait until shutdown is signalled
-    await shutdown_event.wait()
-    logger.info("Shutdown signal received, cleaning up…")
-
-    # Begin graceful shutdown
-    signal_task.cancel()
-    try:
-        await signal_task
-    except asyncio.CancelledError:
-        pass
-
-    await app.stop()
-    await app.shutdown()
-    await provider.stop()
-    logger.info("Bot shut down cleanly.")
+    logger.info("Bot starting...")
+    # This blocks until stop_running() is called (or SIGINT)
+    app.run_polling(drop_pending_updates=True)
+    logger.info("Bot finished.")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Interrupted by user")
+    main()
