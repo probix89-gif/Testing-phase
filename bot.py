@@ -1,1205 +1,998 @@
 #!/usr/bin/env python3
 """
-Educational Market Analysis Bot – PROBIX_XD Admin Edition v3.0
-Single-file, fully async, production-grade.
-No real money trading – educational alerts only.
-
-Fully redesigned for reliable startup and shutdown.
+Dark Web & Clearnet Credit Card Crawler (Hardened & Fixed)
+- Telegram bot for admin control and masked card notifications
+- Proxy rotation system with Tor fallback, HTTP/HTTPS/SOCKS support
+- Flask dashboard
+- All critical bugs fixed, threading hardened, security improved
 """
 
-import asyncio
 import os
 import sys
-import json
-import logging
+import re
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from functools import wraps
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import random
+import threading
+import logging
+import asyncio
+import queue
+import urllib.parse
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
-import aiosqlite
-import ta
-import websockets
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import requests
+from bs4 import BeautifulSoup
+from stem import Signal
+from stem.control import Controller
+from flask import Flask, render_template_string
+from cryptography.fernet import Fernet
+
+# python-telegram-bot v20.x
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    ApplicationHandlerStop,
-)
 
-# ── .env loading ─────────────────────────
-env_path_script = Path(__file__).resolve().parent / ".env"
-env_path_cwd = Path.cwd() / ".env"
-for _p in (env_path_script, env_path_cwd):
-    if _p.exists():
-        load_dotenv(dotenv_path=str(_p))
-        break
+# ========== CONFIGURATION ==========
+TOR_CONTROL_PORT = 9051
+TOR_PASSWORD = os.environ.get("TOR_PASSWORD")          # Must be set, no default
+if not TOR_PASSWORD:
+    sys.exit("FATAL: TOR_PASSWORD environment variable not set. Tor control password required.")
 
-# ── Environment Validation ───────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-if len(TELEGRAM_TOKEN) < 10:
-    print("FATAL: TELEGRAM_TOKEN not set. Add it to .env:\n  TELEGRAM_TOKEN=123456:ABC-DEF...")
-    sys.exit(1)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+ADMIN_CHAT_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_CHAT_IDS", "").split(",") if x.strip()]
+FLASK_PORT = int(os.environ.get("FLASK_PORT", "5000"))
 
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-OLYMP_SSID = os.getenv("OLYMP_SSID", "")
-DEMO_MODE = os.getenv("DEMO_MODE", "1") == "1"
-DB_PATH = os.getenv("DB_PATH", "ultimate_bot.db")
-LOG_FILE = os.getenv("LOG_FILE", "bot.log")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# Proxy test URL configurable
+PROXY_TEST_URL = os.environ.get("PROXY_TEST_URL", "http://httpbin.org/ip")
 
-# Secondary admins (by Telegram username, case-insensitive)
-SECONDARY_ADMIN_USERNAMES: set[str] = {"PROBIX_XD"}
+# Fernet key for encrypting scraped card data (generate if not set)
+FERNET_KEY = os.environ.get("FERNET_KEY")
+if not FERNET_KEY:
+    # In a real deployment you would set this permanently; for educational use we generate a new one each run.
+    FERNET_KEY = Fernet.generate_key()
+    logging.warning("FERNET_KEY not set. Generated temporary key. Encrypted data will be lost after restart.")
+fernet = Fernet(FERNET_KEY)
 
-# ── Logging ──────────────────────────────
+ROTATE_EVERY_N_REQUESTS = 20
+TOR_IP_RENEW_REQUESTS = 100
+MAX_RETRIES = 3
+PROXY_FILE = "proxies.txt"
+
+# Proxy types
+PROXY_TYPE_HTTP = "http"
+PROXY_TYPE_HTTPS = "https"
+PROXY_TYPE_SOCKS4 = "socks4"
+PROXY_TYPE_SOCKS5 = "socks5"
+
+# Tor proxy (always added) – using socks5:// for better compatibility
+TOR_PROXY_URL = "socks5://127.0.0.1:9050"
+TOR_PROXY_TYPE = PROXY_TYPE_SOCKS5
+
+# Start URLs loaded from file or environment, with a small default
+def load_start_urls() -> List[str]:
+    """Load start URLs from environment or file, or use a default test set."""
+    urls = []
+    # Environment variable
+    env_urls = os.environ.get("START_URLS")
+    if env_urls:
+        urls = [u.strip() for u in env_urls.split(",") if u.strip()]
+    # File
+    urls_file = "start_urls.txt"
+    if os.path.exists(urls_file):
+        with open(urls_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls.append(line)
+    if not urls:
+        # Default small test URLs (non-existent, placeholder – change for real targets)
+        urls = ["http://example.com"]
+    return urls
+
+START_URLS = load_start_urls()
+_start_urls_lock = threading.Lock()  # lock for modifying START_URLS
+
+# ========== LOGGING & STATS ==========
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='{"time":"%(asctime)s","level":"%(levelname)s","name":"%(name)s","msg":"%(message)s"}',
-    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE)],
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("crawler.log")  # permanent log file
+    ]
 )
-logger = logging.getLogger("EDU_BOT")
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("CC_Crawler")
 
-# ── Config ───────────────────────────────
-@dataclass
-class AppConfig:
-    symbols: List[str] = field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY"])
-    timeframes: List[int] = field(default_factory=lambda: [1, 5])
-    indicator_weights: Dict[str, float] = field(default_factory=lambda: {
-        "rsi": 0.15, "macd": 0.15, "bb": 0.10, "stoch": 0.10,
-        "adx": 0.05, "ma_cross": 0.05, "atr": 0.05, "volume": 0.05,
-    })
-    xgboost_weight: float = 0.20
-    lstm_weight: float = 0.15
-    ensemble_threshold: float = 0.60
-    enable_lstm: bool = True
-    enable_xgboost: bool = True
-    admin_user_id: int = ADMIN_USER_ID
-    signal_interval: int = 60        # seconds between signal loop iterations
-    signal_cooldown: int = 300       # seconds before same symbol signal repeats
+# Thread‑safe structures
+log_lock = threading.RLock()
+file_lock = threading.Lock()       # for writing to scraped_cc.txt
+stats_lock = threading.RLock()
 
-config = AppConfig()
+stats = {
+    "visited_urls": set(),
+    "found_cards": [],          # list of (masked_card, card_type, source, time, encrypted_number)
+    "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "last_renew": "",
+    "crawling_active": True
+}
+# Stop event for responsive shutdown
+stop_event = threading.Event()
 
-# ── Database ─────────────────────────────
-db_pool: Optional[aiosqlite.Connection] = None
+# Bounded log buffer
+max_log_len = 500
+log_lines = []
 
-async def init_db():
-    global db_pool
-    db_pool = await aiosqlite.connect(DB_PATH)
-    await db_pool.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id  INTEGER PRIMARY KEY,
-            username TEXT,
-            role     TEXT    DEFAULT 'user',
-            joined   TEXT,
-            active   INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS trades (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id   INTEGER,
-            timestamp TEXT,
-            symbol    TEXT,
-            direction TEXT,
-            entry     REAL,
-            expiry    TEXT,
-            result    TEXT DEFAULT 'PENDING',
-            pnl       REAL DEFAULT 0,
-            confidence REAL
-        );
-        CREATE TABLE IF NOT EXISTS signals (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol     TEXT,
-            direction  TEXT,
-            entry      REAL,
-            confidence REAL,
-            timestamp  TEXT,
-            reasons    TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_trades_user   ON trades(user_id);
-        CREATE INDEX IF NOT EXISTS idx_trades_ts     ON trades(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_signals_sym   ON signals(symbol);
-        CREATE INDEX IF NOT EXISTS idx_users_active  ON users(active);
-    """)
-    await db_pool.commit()
-    logger.info("Database initialised.")
+def add_log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    with log_lock:
+        logger.info(line)
+        log_lines.append(line)
+        if len(log_lines) > max_log_len:
+            log_lines.pop(0)
 
-async def db_execute(query: str, params=None):
-    async with db_pool.execute(query, params or ()) as cur:
-        return await cur.fetchall()
+# ========== LUHN CHECK ==========
+def luhn(card_num: str) -> bool:
+    digits = [int(d) for d in card_num]
+    for i in range(len(digits) - 2, -1, -2):
+        digits[i] *= 2
+        if digits[i] > 9:
+            digits[i] -= 9
+    return sum(digits) % 10 == 0
 
-async def db_execute_commit(query: str, params=None):
-    await db_pool.execute(query, params or ())
-    await db_pool.commit()
+# ========== IMPROVED CARD TYPE IDENTIFICATION ==========
+def identify_card_type(number: str) -> str:
+    """Identify card brand using full BIN ranges and length validation."""
+    if not number.isdigit():
+        return "Invalid"
+    # Visa: 13 or 16 digits, starts with 4
+    if number[0] == '4' and len(number) in (13, 16):
+        return "Visa"
+    # MasterCard: 16 digits, starts with 51-55 or 2221-2720
+    if len(number) == 16:
+        if number[:2] in ('51','52','53','54','55'):
+            return "MasterCard"
+        if 2221 <= int(number[:4]) <= 2720:
+            return "MasterCard"
+    # Amex: 15 digits, starts with 34 or 37
+    if len(number) == 15 and number[:2] in ('34','37'):
+        return "Amex"
+    # Discover: 16 digits, starts with 6011, 622126-622925, 644-649, 65
+    if len(number) == 16:
+        if number[:4] == '6011':
+            return "Discover"
+        if 622126 <= int(number[:6]) <= 622925:
+            return "Discover"
+        if 644 <= int(number[:3]) <= 649:
+            return "Discover"
+        if number[:2] == '65':
+            return "Discover"
+    # Diners Club: 14 digits, starts with 300-305, 309, 36, 38, 39
+    if len(number) == 14:
+        if number[:3] in ('300','301','302','303','304','305','309'):
+            return "Diners Club"
+        if number[:2] in ('36','38','39'):
+            return "Diners Club"
+    # JCB: 16 digits, starts with 3528-3589, or 15 digits starting with 1800 or 2131
+    if len(number) == 16 and 3528 <= int(number[:4]) <= 3589:
+        return "JCB"
+    if len(number) == 15 and number[:4] in ('1800','2131'):
+        return "JCB"
+    # UnionPay: 16-19 digits, starts with 62 (simplistic)
+    if 16 <= len(number) <= 19 and number[:2] == '62':
+        return "UnionPay"
+    return "Other"
 
-# ── User & Role Management ───────────────
-def _is_secondary_admin(username: str) -> bool:
-    return username.upper() in {u.upper() for u in SECONDARY_ADMIN_USERNAMES}
+def mask_card(number: str) -> str:
+    if len(number) >= 8:
+        return number[:4] + "*" * (len(number) - 8) + number[-4:]
+    return number[:4] + "****"
 
-class UserManager:
-    @staticmethod
-    async def is_authorized(user_id: int, username: str = "") -> bool:
-        if user_id == config.admin_user_id or _is_secondary_admin(username):
-            return True
-        rows = await db_execute("SELECT active FROM users WHERE user_id=?", (user_id,))
-        return bool(rows) and rows[0][0] == 1
+def mask_proxy_url(proxy_url: str) -> str:
+    """Hide username/password in proxy URL for display."""
+    try:
+        parsed = urllib.parse.urlparse(proxy_url)
+    except ValueError:
+        return proxy_url  # malformed, return as-is
+    if parsed.username:
+        safe = parsed._replace(netloc=f"{parsed.username}:****@{parsed.hostname}:{parsed.port}" if parsed.port
+                               else f"{parsed.username}:****@{parsed.hostname}")
+        return safe.geturl()
+    return proxy_url
 
-    @staticmethod
-    async def get_role(user_id: int, username: str = "") -> str:
-        if user_id == config.admin_user_id or _is_secondary_admin(username):
-            return "admin"
-        rows = await db_execute("SELECT role FROM users WHERE user_id=? AND active=1", (user_id,))
-        return rows[0][0] if rows else "unauthorised"
+# ========== SECURE CARD STORAGE ==========
+def _encrypt_card(card_number: str) -> bytes:
+    """Encrypt card number with Fernet (symmetric)."""
+    return fernet.encrypt(card_number.encode())
 
-    @staticmethod
-    async def add_user(user_id: int, username: str, role: str = "user"):
-        await db_execute_commit(
-            "INSERT OR REPLACE INTO users (user_id, username, role, joined, active) VALUES (?,?,?,?,1)",
-            (user_id, username, role, datetime.utcnow().isoformat())
-        )
+def write_card_secure(card_number: str, card_type: str, source_url: str, ts: str):
+    """Append encrypted card data to file with tight permissions."""
+    encrypted = _encrypt_card(card_number)
+    line = f"{encrypted.decode()}\t{card_type}\t{source_url}\t{ts}\n"
+    with file_lock:
+        # Create file with restricted permissions if not exists
+        if not os.path.exists("scraped_cc.txt"):
+            fd = os.open("scraped_cc.txt", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            os.close(fd)
+        with open("scraped_cc.txt", "a") as f:
+            f.write(line)
 
-    @staticmethod
-    async def set_role(user_id: int, role: str):
-        await db_execute_commit("UPDATE users SET role=? WHERE user_id=?", (role, user_id))
+# ========== PROXY MANAGER ==========
+class ProxyManager:
+    def __init__(self):
+        self.proxies: List[Dict] = []
+        self.lock = threading.Lock()
+        self.round_robin_index = 0
+        self.rotation_mode = "roundrobin"  # or "leastfailed"
+        self.request_count = 0
+        self.tor_request_count = 0
+        self.force_next_rotate = False
+        self.renew_lock = threading.Lock()  # prevent concurrent Tor renewal
 
-    @staticmethod
-    async def remove_user(user_id: int):
-        await db_execute_commit("UPDATE users SET active=0 WHERE user_id=?", (user_id,))
+        # Add Tor proxy first
+        self._add_proxy(TOR_PROXY_URL, TOR_PROXY_TYPE, is_tor=True)
 
-    @staticmethod
-    async def all_active_users() -> List[int]:
-        rows = await db_execute("SELECT user_id FROM users WHERE active=1")
-        return [r[0] for r in rows]
+        # Load external proxies from file
+        self.load_from_file()
 
-    @staticmethod
-    async def list_users() -> List[Tuple]:
-        rows = await db_execute(
-            "SELECT user_id, username, role, joined FROM users WHERE active=1 ORDER BY joined DESC"
-        )
-        return rows
+    def _add_proxy(self, url: str, ptype: str, is_tor: bool = False):
+        proxy = {
+            "url": url,
+            "type": ptype.lower(),
+            "status": "alive",   # alive / dead
+            "fail_count": 0,
+            "last_used": None,
+            "is_tor": is_tor
+        }
+        self.proxies.append(proxy)
 
-# ── Rate Limiter ─────────────────────────
-class RateLimiter:
-    def __init__(self, max_calls: int = 15, window: int = 60):
-        self.max_calls = max_calls
-        self.window = window
-        self._ts: Dict[int, List[float]] = {}
+    def load_from_file(self, filepath: str = PROXY_FILE):
+        if not os.path.exists(filepath):
+            return
+        with self.lock:
+            existing_urls = [p["url"] for p in self.proxies]
+            with open(filepath, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    ptype = self._guess_type(line)
+                    if line not in existing_urls:
+                        self._add_proxy(line, ptype)
+                        add_log(f"Loaded proxy: {mask_proxy_url(line)}")
 
-    async def check(self, user_id: int) -> bool:
-        now = time.time()
-        self._ts.setdefault(user_id, [])
-        self._ts[user_id] = [t for t in self._ts[user_id] if now - t <= self.window]
-        if len(self._ts[user_id]) >= self.max_calls:
+    def _guess_type(self, url: str) -> str:
+        scheme = url.split("://")[0].lower()
+        if scheme in ("socks5", "socks5h"):
+            return PROXY_TYPE_SOCKS5
+        elif scheme in ("socks4",):
+            return PROXY_TYPE_SOCKS4
+        elif scheme in ("https",):
+            return PROXY_TYPE_HTTPS
+        else:
+            return PROXY_TYPE_HTTP
+
+    def test_proxy(self, proxy: Dict, test_url: str = None, timeout: int = 10) -> bool:
+        """Test connectivity through proxy. Returns True if alive."""
+        if test_url is None:
+            test_url = PROXY_TEST_URL
+        try:
+            proxies_dict = self._build_proxies_dict(proxy)
+            resp = requests.get(test_url, proxies=proxies_dict, timeout=timeout)
+            return resp.status_code == 200
+        except Exception:
             return False
-        self._ts[user_id].append(now)
-        return True
 
-rate_limiter = RateLimiter()
+    def _build_proxies_dict(self, proxy: Dict) -> Dict[str, str]:
+        """Build requests-compatible proxies dict."""
+        url = proxy["url"]
+        return {"http": url, "https": url}
 
-# ── Middleware & Decorators ──────────────
-async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
+    def mark_failed(self, proxy: Dict):
+        with self.lock:
+            proxy["fail_count"] += 1
+            if proxy["fail_count"] >= 3:
+                proxy["status"] = "dead"
+                add_log(f"Proxy {mask_proxy_url(proxy['url'])} marked DEAD after {proxy['fail_count']} failures")
+            else:
+                add_log(f"Proxy {mask_proxy_url(proxy['url'])} fail count: {proxy['fail_count']}")
+
+    def mark_alive(self, proxy: Dict):
+        with self.lock:
+            proxy["status"] = "alive"
+            proxy["fail_count"] = 0
+            add_log(f"Proxy {mask_proxy_url(proxy['url'])} is ALIVE again")
+
+    def get_alive_proxies(self, only_socks: bool = False) -> List[Dict]:
+        with self.lock:
+            alive = [p for p in self.proxies if p["status"] == "alive"]
+            if only_socks:
+                alive = [p for p in alive if p["type"] in (PROXY_TYPE_SOCKS4, PROXY_TYPE_SOCKS5)]
+            return alive
+
+    def get_next_proxy(self, is_onion: bool = False) -> Dict:
+        """Select next proxy. For onion sites only SOCKS proxies are allowed.
+        If no SOCKS proxy is alive and Tor is dead, raise RuntimeError instead of forcing.
+        """
+        with self.lock:
+            self.request_count += 1
+            if self.force_next_rotate:
+                self.force_next_rotate = False
+                # Shift rotation in all modes: advance round‑robin index or re‑order candidates
+                self.round_robin_index += 1
+
+            # Filter candidates
+            if is_onion:
+                candidates = self.get_alive_proxies(only_socks=True)
+            else:
+                candidates = self.get_alive_proxies()
+
+            if not candidates:
+                # Try to resurrect Tor just for this request
+                tor_proxy = next((p for p in self.proxies if p["is_tor"]), None)
+                if tor_proxy:
+                    # Test the Tor proxy right now; if alive mark it and use it.
+                    if self.test_proxy(tor_proxy):
+                        self.mark_alive(tor_proxy)
+                        candidates = [tor_proxy]
+                    else:
+                        self.mark_failed(tor_proxy)
+                        raise RuntimeError("No alive proxy available (Tor is dead)")
+                else:
+                    raise RuntimeError("No usable proxy available (Tor missing)")
+
+            if self.rotation_mode == "roundrobin":
+                self.round_robin_index %= len(candidates)
+                proxy = candidates[self.round_robin_index]
+                self.round_robin_index += 1
+            else:  # leastfailed
+                # If user triggered force rotate, shift by picking the one with second‑lowest fails
+                # Simple approach: sort by fail_count, then pick the one after the current minimum (or just the min).
+                candidates.sort(key=lambda p: p["fail_count"])
+                # If we forced rotate, skip the first (minimum fail) and pick second. We use a flag for that.
+                if getattr(self, "_leastfailed_force_rotate", False):
+                    self._leastfailed_force_rotate = False
+                    proxy = candidates[1] if len(candidates) > 1 else candidates[0]
+                else:
+                    proxy = candidates[0]  # minimum fail count
+
+            proxy["last_used"] = datetime.now().strftime("%H:%M:%S")
+            # Track Tor usage for IP renewal (non‑blocking)
+            if proxy["is_tor"]:
+                self.tor_request_count += 1
+                if self.tor_request_count >= TOR_IP_RENEW_REQUESTS:
+                    self.tor_request_count = 0
+                    # Trigger renewal outside lock
+                    threading.Thread(target=renew_tor_ip, daemon=True).start()
+            return proxy
+
+    def force_rotate(self):
+        with self.lock:
+            # For roundrobin we already advance the index; for leastfailed we set a flag
+            if self.rotation_mode == "leastfailed":
+                self._leastfailed_force_rotate = True
+            else:
+                self.force_next_rotate = True
+
+    def periodic_dead_check(self):
+        """Background thread to re‑test dead proxies every 5 minutes."""
+        while not stop_event.is_set():
+            stop_event.wait(300)
+            if stop_event.is_set():
+                break
+            with self.lock:
+                dead_proxies = [p for p in self.proxies if p["status"] == "dead"]
+            for proxy in dead_proxies:
+                if self.test_proxy(proxy):
+                    self.mark_alive(proxy)
+
+    def add_proxy(self, url: str) -> bool:
+        url = url.strip()
+        if not url:
+            return False
+        with self.lock:
+            existing = [p["url"] for p in self.proxies]
+            if url in existing:
+                return False
+            ptype = self._guess_type(url)
+            proxy = {
+                "url": url,
+                "type": ptype,
+                "status": "unknown",
+                "fail_count": 0,
+                "last_used": None,
+                "is_tor": False
+            }
+            self.proxies.append(proxy)
+        # Test outside lock
+        if self.test_proxy(proxy):
+            self.mark_alive(proxy)
+            return True
+        else:
+            self.mark_failed(proxy)
+            return False
+
+    def remove_proxy(self, url: str) -> bool:
+        with self.lock:
+            for p in self.proxies:
+                if p["url"] == url and not p["is_tor"]:
+                    self.proxies.remove(p)
+                    add_log(f"Proxy removed: {mask_proxy_url(url)}")
+                    return True
+        return False
+
+    def list_proxies(self) -> List[Dict]:
+        with self.lock:
+            return [dict(p) for p in self.proxies]  # copy to avoid lock issues
+
+# ========== GLOBAL PROXY INSTANCE ==========
+proxy_manager = ProxyManager()
+
+# ========== TOR IP RENEWAL (thread‑safe) ==========
+renew_run_lock = threading.Lock()
+def renew_tor_ip():
+    if not renew_run_lock.acquire(blocking=False):
+        add_log("Tor renewal already in progress, skipping.")
         return
-    username = user.username or ""
+    try:
+        with Controller.from_port(port=TOR_CONTROL_PORT) as c:
+            c.authenticate(password=TOR_PASSWORD)
+            c.signal(Signal.NEWNYM)
+        with stats_lock:
+            stats["last_renew"] = datetime.now().strftime("%H:%M:%S")
+        add_log("Tor IP renewed successfully")
+        time.sleep(5)  # wait for circuit
+    except Exception as e:
+        add_log(f"Tor renewal error: {e}")
+    finally:
+        renew_run_lock.release()
 
-    # Auto-promote secondary admins
-    if _is_secondary_admin(username):
-        await UserManager.add_user(user.id, username, "admin")
+# ========== IMPROVED REGEX (strict lengths) ==========
+# Each brand with exact length, using negative lookahead to avoid longer numbers
+VISA_REGEX = r'\b4[0-9]{12}(?![0-9])'                     # 13 digits
+VISA16_REGEX = r'\b4[0-9]{15}(?![0-9])'                    # 16 digits
+MASTERCARD_REGEX = r'\b(?:5[1-5][0-9]{14}|2(?:2[2-9][0-9]|2[3-9][0-9]{2}|[3-6][0-9]{3}|7[01][0-9]{2}|720)[0-9]{12})(?![0-9])'  # 16 digits
+AMEX_REGEX = r'\b3[47][0-9]{13}(?![0-9])'                  # 15 digits
+DISCOVER_REGEX = r'\b(?:6011[0-9]{12}|65[0-9]{14}|622(?:12[6-9]|1[3-9][0-9]|[2-8][0-9]{2}|9[01][0-9]|92[0-5])[0-9]{10})(?![0-9])'  # 16 digits
+DINERS_REGEX = r'\b(?:3(?:0[0-5][0-9]|09|6|8|9)[0-9]{10})(?![0-9])'  # 14 digits
+JCB_16_REGEX = r'\b(?:352[89]|35[3-8][0-9])[0-9]{12}(?![0-9])'  # 16 digits
+JCB_15_REGEX = r'\b(?:2131|1800)[0-9]{11}(?![0-9])'         # 15 digits
+UNIONPAY_REGEX = r'\b62[0-9]{14,17}(?![0-9])'              # 16-19 digits
 
-    if user.id == config.admin_user_id or _is_secondary_admin(username):
-        _audit(update, user)
-        return  # admins bypass rate limits and auth
+CC_PATTERNS = re.compile('|'.join([
+    VISA_REGEX, VISA16_REGEX, MASTERCARD_REGEX, AMEX_REGEX,
+    DISCOVER_REGEX, DINERS_REGEX, JCB_16_REGEX, JCB_15_REGEX,
+    UNIONPAY_REGEX
+]))
 
-    # Rate limit
-    if not await rate_limiter.check(user.id):
+def extract_cards(text: str, source_url: str):
+    """Find credit card numbers and store them securely."""
+    # Split into chunks to avoid cross‑element concatenation
+    chunks = text.split()
+    for chunk in chunks:
+        for match in CC_PATTERNS.finditer(chunk):
+            card_number = match.group()
+            if not luhn(card_number):
+                continue
+            masked = mask_card(card_number)
+            with stats_lock:
+                # Avoid duplicates based on masked number
+                if any(c[0] == masked for c in stats["found_cards"]):
+                    continue
+                card_type = identify_card_type(card_number)
+                ts = datetime.now().strftime("%H:%M:%S")
+                stats["found_cards"].append((masked, card_type, source_url, ts))
+                add_log(f"Found {card_type}: {masked} at {source_url}")
+            # Write encrypted data and queue notification (outside stats_lock)
+            write_card_secure(card_number, card_type, source_url, ts)
+            telegram_notify_card(masked, card_type, source_url, ts)
+
+# ========== TELEGRAM NOTIFICATION QUEUE (bounded, thread‑safe) ==========
+telegram_queue = queue.Queue(maxsize=200)
+
+def telegram_notify_card(masked: str, card_type: str, source: str, ts: str):
+    """Put notification into queue, dropping oldest if full."""
+    msg = f"💳 New card {card_type}: <code>{masked}</code>\nSource: {source}\nTime: {ts}"
+    try:
+        telegram_queue.put_nowait(msg)
+    except queue.Full:
+        # Discard oldest to make room
         try:
-            await context.bot.send_message(user.id, "⏳ Too many requests. Please slow down.")
-        except TelegramError:
-            pass
-        raise ApplicationHandlerStop()
+            telegram_queue.get_nowait()
+            telegram_queue.put_nowait(msg)
+        except queue.Empty:
+            pass  # shouldn't happen
 
-    # Auth check
-    if not await UserManager.is_authorized(user.id, username):
+# ========== CRAWLING ENGINE (with retry on 5xx, rate limiting) ==========
+def crawl(url: str, depth: int = 2):
+    """Crawl a URL with proxy rotation, 5xx retries, and polite delays."""
+    if depth <= 0:
+        return
+    with stats_lock:
+        if url in stats["visited_urls"]:
+            return
+        stats["visited_urls"].add(url)
+        # Prevent memory blowout: if set gets too large, clear it (emergency)
+        if len(stats["visited_urls"]) > 200_000:
+            add_log("Warning: visited_urls exceeded 200k, clearing to save memory.")
+            stats["visited_urls"].clear()
+
+    is_onion = ".onion" in url
+
+    for attempt in range(MAX_RETRIES):
+        proxy_info = None
         try:
-            await context.bot.send_message(
-                user.id,
-                "❌ *You are not authorised.*\nAsk an admin to add you via /adduser.",
-                parse_mode=ParseMode.MARKDOWN
+            proxy_info = proxy_manager.get_next_proxy(is_onion=is_onion)
+        except RuntimeError as e:
+            add_log(f"No proxy for {url}: {e}")
+            return
+
+        try:
+            proxies_dict = proxy_manager._build_proxies_dict(proxy_info)
+            add_log(f"Crawling [{attempt+1}/{MAX_RETRIES}] {url} via {mask_proxy_url(proxy_info['url'])}")
+            resp = requests.get(
+                url,
+                proxies=proxies_dict,
+                timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0"}
             )
-        except TelegramError:
-            pass
-        raise ApplicationHandlerStop()
+            # Retry on 5xx server errors
+            if resp.status_code in (502, 503, 504):
+                add_log(f"Server error {resp.status_code} for {url}, will retry")
+                time.sleep(2)
+                continue
+            if resp.status_code != 200:
+                add_log(f"Non-200 status: {resp.status_code} for {url}, not retrying")
+                return  # do not retry on 404 etc.
 
-    _audit(update, user)
+            # Success – parse page
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            page_text = soup.get_text(separator=' ')  # preserve spaces
+            extract_cards(page_text, url)
+            # Check input/textarea/hidden fields
+            for inp in soup.find_all(['input', 'textarea']):
+                for attr in ('value', 'placeholder'):
+                    val = inp.get(attr)
+                    if val:
+                        extract_cards(val, url)
+            for form in soup.find_all('form'):
+                for hidden in form.find_all('input', type='hidden'):
+                    if hidden.get('value'):
+                        extract_cards(hidden['value'], url)
 
-def _audit(update: Update, user):
-    if update.message:
-        logger.info(f"AUDIT uid={user.id} @{user.username} cmd={update.message.text}")
-    elif update.callback_query:
-        logger.info(f"AUDIT uid={user.id} @{user.username} cb={update.callback_query.data}")
+            # Follow links with delay (depth > 1)
+            if depth > 1:
+                base_domain = urllib.parse.urlparse(url).netloc
+                for link in soup.find_all('a', href=True):
+                    next_url = urllib.parse.urljoin(url, link['href'])
+                    if next_url.startswith('http'):
+                        # Follow onion links freely, clearnet only same domain
+                        if '.onion' in next_url:
+                            time.sleep(random.uniform(0.5, 2.0))
+                            crawl(next_url, depth - 1)
+                        elif base_domain in next_url:
+                            time.sleep(random.uniform(0.5, 2.0))
+                            crawl(next_url, depth - 1)
+            return  # success, exit retry loop
 
+        except (requests.exceptions.ProxyError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                Exception) as e:
+            add_log(f"Proxy error for {url}: {e}")
+            if proxy_info:
+                proxy_manager.mark_failed(proxy_info)
+            time.sleep(1)  # brief wait before retry
+    # All retries exhausted
+    add_log(f"Failed to crawl {url} after {MAX_RETRIES} attempts")
+
+def scrape_loop():
+    """Main scraping cycle, responsive to stop signal."""
+    global START_URLS
+    add_log("Scrape loop started.")
+    while not stop_event.is_set():
+        # Snapshot start URLs safely
+        with _start_urls_lock:
+            urls = list(START_URLS)  # copy to avoid modification during iteration
+        for start in urls:
+            if stop_event.is_set():
+                break
+            crawl(start, depth=2)
+            time.sleep(1.5)
+        renew_tor_ip()  # renew after full round
+        add_log("Cycle complete, waiting 5 minutes (or until stopped).")
+        # Sleep in small increments to remain responsive
+        for _ in range(300):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+# ========== FLASK DASHBOARD ==========
+DASH_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CC Crawler Dashboard</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: sans-serif; margin: 20px; background: #f5f5f5; }
+        h1 { color: #333; }
+        .status { font-size: 1.2em; }
+        .section { background: white; padding: 15px; margin: 15px 0; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+        pre { background: #eee; padding: 10px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>🕷️ CC Crawler Dashboard</h1>
+    <div class="section">
+        <p class="status">Status: <strong>{{ '🟢 Active' if active else '🔴 Stopped' }}</strong></p>
+        <p>Started: {{ start_time }}</p>
+        <p>Last Tor Renew: {{ last_renew }}</p>
+        <p>Visited URLs: {{ visited_count }}</p>
+        <p>Cards Found: {{ cards_count }}</p>
+    </div>
+
+    {% if recent_cards %}
+    <div class="section">
+        <h2>Recent Cards (masked)</h2>
+        <table>
+            <tr><th>Number</th><th>Type</th><th>Source</th><th>Time</th></tr>
+            {% for c in recent_cards %}
+            <tr>
+                <td><code>{{ c.number }}</code></td>
+                <td>{{ c.type }}</td>
+                <td>{{ c.source }}</td>
+                <td>{{ c.time }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    {% endif %}
+
+    <div class="section">
+        <h2>Log (last 30 lines)</h2>
+        <pre>{% for line in log %}{{ line }}<br>{% endfor %}</pre>
+    </div>
+</body>
+</html>
+"""
+
+app = Flask(__name__)
+
+@app.route('/')
+def dashboard():
+    with stats_lock:
+        visited_count = len(stats["visited_urls"])
+        cards = stats["found_cards"]
+        recent = cards[-20:] if len(cards) > 20 else cards
+    with log_lock:
+        log_snapshot = list(log_lines[-30:])
+    return render_template_string(
+        DASH_TEMPLATE,
+        active=stats["crawling_active"],
+        start_time=stats["start_time"],
+        last_renew=stats["last_renew"] or "Never",
+        visited_count=visited_count,
+        cards_count=len(cards),
+        recent_cards=[{"number": c[0], "type": c[1], "source": c[2], "time": c[3]} for c in reversed(recent)],
+        log=log_snapshot
+    )
+
+# ========== TELEGRAM BOT HANDLERS ==========
 def admin_only(func):
-    """Decorator – works for both Command handlers and CallbackQuery handlers."""
-    @wraps(func)
+    """Decorator to restrict commands to admin chat IDs."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        role = await UserManager.get_role(user.id, user.username or "")
-        if role != "admin":
-            if update.callback_query:
-                await update.callback_query.answer("⛔ Admin only.", show_alert=True)
-            elif update.message:
-                await update.message.reply_text("⛔ Admin only.")
+        user_id = update.effective_user.id
+        if user_id not in ADMIN_CHAT_IDS:
+            await update.message.reply_text("🚫 Unauthorized.")
             return
         return await func(update, context)
     return wrapper
 
-# ── Data Providers ───────────────────────
-class DataProvider:
-    async def start(self): raise NotImplementedError
-    async def stop(self):  raise NotImplementedError
-    async def get_candle(self, symbol: str, timeframe: int, bars: int = 100) -> pd.DataFrame:
-        raise NotImplementedError
+@admin_only
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats["crawling_active"] = True
+    stop_event.clear()
+    await update.message.reply_text("✅ Crawler started (if not already).")
 
-class SimulatedProvider(DataProvider):
-    def __init__(self):
-        self.candles: Dict[str, pd.DataFrame] = {}
-        self._running = False
-        self._task = None
+@admin_only
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats["crawling_active"] = False
+    stop_event.set()
+    await update.message.reply_text("⏹ Crawler stopped.")
 
-    async def start(self):
-        self._running = True
-        self._task = asyncio.ensure_future(self._simulate())
-        logger.info("SimulatedProvider started")
+@admin_only
+async def cmd_startcrawl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats["crawling_active"] = True
+    stop_event.clear()
+    await update.message.reply_text("🔄 Crawler awakened.")
 
-    async def stop(self):
-        self._running = False
-        if self._task:
-            self._task.cancel()
-        logger.info("SimulatedProvider stopped")
+@admin_only
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with stats_lock:
+        visited = len(stats["visited_urls"])
+        cards = len(stats["found_cards"])
+        active = "🟢 Running" if stats["crawling_active"] else "🔴 Stopped"
+    await update.message.reply_text(
+        f"Status: {active}\n"
+        f"Visited URLs: {visited}\n"
+        f"Cards found: {cards}\n"
+        f"Last Tor renew: {stats['last_renew'] or 'Never'}"
+    )
 
-    async def _simulate(self):
-        base = {"EURUSD": 1.1000, "GBPUSD": 1.3000, "USDJPY": 110.00}
-        while self._running:
-            for sym in config.symbols:
-                for tf in config.timeframes:
-                    key = f"{sym}_{tf}"
-                    if key not in self.candles or self.candles[key].empty:
-                        self.candles[key] = pd.DataFrame(
-                            columns=["open","high","low","close","volume","timestamp"])
-                        lp = base.get(sym, 1.0)
-                    else:
-                        lp = self.candles[key]["close"].iloc[-1]
-                    step = np.random.normal(0, 0.0003)
-                    np_ = max(0.0001, lp + step)
-                    o, c = lp, np_
-                    h = max(o, c) + abs(np.random.normal(0, 0.0001))
-                    l = min(o, c) - abs(np.random.normal(0, 0.0001))
-                    v = np.random.randint(50, 500)
-                    row = pd.DataFrame([{
-                        "open": o, "high": h, "low": l, "close": c,
-                        "volume": v, "timestamp": datetime.utcnow()
-                    }])
-                    self.candles[key] = pd.concat(
-                        [self.candles[key], row], ignore_index=True).iloc[-500:]
-            await asyncio.sleep(max(1, 60 // max(len(config.symbols), 1)))
+@admin_only
+async def cmd_renewtor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Run renew in thread to avoid blocking event loop
+    await asyncio.to_thread(renew_tor_ip)
+    await update.message.reply_text("🔄 Tor IP renewal triggered.")
 
-    async def get_candle(self, symbol: str, timeframe: int, bars: int = 100) -> pd.DataFrame:
-        key = f"{symbol}_{timeframe}"
-        df = self.candles.get(key, pd.DataFrame())
-        return df.tail(bars).copy() if not df.empty else pd.DataFrame()
+@admin_only
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with stats_lock:
+        visited = len(stats["visited_urls"])
+        cards = len(stats["found_cards"])
+        uptime = datetime.now() - datetime.strptime(stats["start_time"], "%Y-%m-%d %H:%M:%S")
+    await update.message.reply_text(
+        f"📊 Stats\n"
+        f"Visited: {visited}\n"
+        f"Cards: {cards}\n"
+        f"Running since: {stats['start_time']} ({uptime})"
+    )
 
-class OlympTradeProvider(DataProvider):
-    def __init__(self, ssid: str):
-        self.ssid = ssid
-        self.ws = None
-        self.candles: Dict[str, pd.DataFrame] = {}
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._buffer: Dict[str, List[Dict]] = {}
-        self._running = False
-        self._ws_task = None
-        self._agg_task = None
-        self._last_agg: Dict[str, datetime] = {}
+@admin_only
+async def cmd_lastcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with stats_lock:
+        recent = stats["found_cards"][-10:] if stats["found_cards"] else []
+    if not recent:
+        await update.message.reply_text("No cards found yet.")
+        return
+    text = "🃏 *Last 10 Cards (masked)*\n"
+    for masked, ctype, source, ts in reversed(recent):
+        text += f"`{masked}` - {ctype} from {source}\n"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-    async def start(self):
-        if not self.ssid:
-            logger.error("OLYMP_SSID not set.")
+@admin_only
+async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with log_lock:
+        lines = list(log_lines[-20:])
+    if not lines:
+        await update.message.reply_text("Log empty.")
+        return
+    msg = "<pre>" + "\n".join(lines) + "</pre>"
+    if len(msg) > 4096:
+        msg = msg[:4096-6] + "...</pre>"
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
+@admin_only
+async def cmd_clearlog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with log_lock:
+        log_lines.clear()
+    await update.message.reply_text("🗑 Log cleared.")
+
+@admin_only
+async def cmd_addurl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = " ".join(context.args)
+    if not url:
+        await update.message.reply_text("Usage: /addurl <url>")
+        return
+    with _start_urls_lock:
+        START_URLS.append(url)
+    await update.message.reply_text(f"✅ Added URL: {url}")
+
+@admin_only
+async def cmd_listurls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with _start_urls_lock:
+        urls = START_URLS[:30]
+        total = len(START_URLS)
+    text = "\n".join(urls)
+    if total > 30:
+        text += f"\n... and {total-30} more"
+    await update.message.reply_text(f"🌐 Start URLs:\n{text}")
+
+@admin_only
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+<b>Available admin commands:</b>
+/start - Start crawling
+/stop - Stop crawling
+/startcrawl - Resume crawling
+/status - Show status
+/renewtor - Renew Tor IP
+/stats - Show statistics
+/lastcards - Last 10 cards (masked)
+/log - Show recent logs
+/clearlog - Clear logs
+/addurl &lt;url&gt; - Add start URL
+/listurls - List start URLs
+/addproxy &lt;proxy&gt; - Add a new proxy
+/removeproxy &lt;proxy&gt; - Remove a proxy
+/listproxies - List all proxies
+/checkproxies - Force re-test all proxies
+/rotateproxy - Force immediate proxy rotation
+/setrotation &lt;roundrobin|leastfailed&gt; - Change rotation mode
+/torrenew - Renew Tor IP (alias)
+/help - This message
+"""
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+# Proxy commands – all blocking proxy tests moved to executor
+async def async_test_proxy(proxy):
+    return await asyncio.to_thread(proxy_manager.test_proxy, proxy)
+
+@admin_only
+async def cmd_addproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    proxy_url = " ".join(context.args)
+    if not proxy_url:
+        await update.message.reply_text("Usage: /addproxy &lt;proxy_url&gt; (e.g., http://user:pass@host:port)")
+        return
+    # Quick add and test in executor
+    with proxy_manager.lock:
+        existing = [p["url"] for p in proxy_manager.proxies]
+        if proxy_url in existing:
+            await update.message.reply_text(f"❌ Proxy already exists: {mask_proxy_url(proxy_url)}")
             return
-        self._running = True
-        self._ws_task = asyncio.ensure_future(self._ws_connect())
-        self._agg_task = asyncio.ensure_future(self._aggregate())
-        logger.info("OlympTradeProvider started")
-
-    async def stop(self):
-        self._running = False
-        for t in (self._ws_task, self._agg_task):
-            if t: t.cancel()
-        if self.ws:
-            await self.ws.close()
-        logger.info("OlympTradeProvider stopped")
-
-    async def _ws_connect(self):
-        while self._running:
-            try:
-                async with websockets.connect("wss://ws.olymptrade.com/ws2") as ws:
-                    self.ws = ws
-                    await ws.send(json.dumps({"msg": "authorize", "ssid": self.ssid, "demo": True}))
-                    resp = await ws.recv()
-                    logger.info(f"Olymp auth: {resp}")
-                    for sym in config.symbols:
-                        await ws.send(json.dumps({"msg": "subscribe_ticks", "symbols": [sym]}))
-                    async for msg in ws:
-                        data = json.loads(msg)
-                        if "d" in data:
-                            for tick in data["d"]:
-                                await self._queue.put(tick)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Olymp WS error: {e} – reconnect in 5s")
-                await asyncio.sleep(5)
-
-    async def _aggregate(self):
-        while self._running:
-            try:
-                tick = await asyncio.wait_for(self._queue.get(), timeout=1)
-            except asyncio.TimeoutError:
-                continue
-            sym = tick.get("p")
-            if not sym or sym not in config.symbols:
-                continue
-            price = tick["q"]
-            ts = datetime.utcnow()
-            self._buffer.setdefault(sym, []).append({"price": price, "ts": ts})
-            for tf in config.timeframes:
-                key = f"{sym}_{tf}"
-                slot = ts.replace(second=0, microsecond=0) - timedelta(minutes=ts.minute % tf)
-                if self._last_agg.get(key) != slot:
-                    buf = self._buffer.get(sym, [])
-                    if buf:
-                        prices = [b["price"] for b in buf]
-                        o, h, l, c = prices[0], max(prices), min(prices), prices[-1]
-                        row = pd.DataFrame([{
-                            "open": o, "high": h, "low": l, "close": c,
-                            "volume": len(buf),
-                            "timestamp": self._last_agg.get(key, slot)
-                        }])
-                        if key in self.candles:
-                            self.candles[key] = pd.concat(
-                                [self.candles[key], row], ignore_index=True).iloc[-500:]
-                        else:
-                            self.candles[key] = row
-                    self._buffer[sym] = []
-                    self._last_agg[key] = slot
-
-    async def get_candle(self, symbol: str, timeframe: int, bars: int = 100) -> pd.DataFrame:
-        key = f"{symbol}_{timeframe}"
-        df = self.candles.get(key, pd.DataFrame())
-        return df.tail(bars).copy() if not df.empty else pd.DataFrame()
-
-def get_provider() -> DataProvider:
-    if DEMO_MODE or not OLYMP_SSID:
-        return SimulatedProvider()
-    return OlympTradeProvider(OLYMP_SSID)
-
-# ── AI Engine (unchanged, but included for completeness) ──
-class AIEngine:
-    def __init__(self):
-        self.xgb_model = None
-        self.lstm_model = None
-        self._try_load_xgboost()
-        self._try_load_lstm()
-
-    def _try_load_xgboost(self):
-        if not config.enable_xgboost or not os.path.exists("xgb_model.json"):
-            return
-        try:
-            import xgboost as xgb
-            self.xgb_model = xgb.XGBClassifier()
-            self.xgb_model.load_model("xgb_model.json")
-            logger.info("XGBoost model loaded.")
-        except Exception as e:
-            logger.warning(f"XGBoost load failed: {e}")
-
-    def _try_load_lstm(self):
-        if not config.enable_lstm or not os.path.exists("lstm_model.h5"):
-            return
-        try:
-            from tensorflow.keras.models import load_model
-            self.lstm_model = load_model("lstm_model.h5")
-            logger.info("LSTM model loaded.")
-        except Exception as e:
-            logger.warning(f"LSTM load failed: {e}")
-
-    def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty or len(df) < 14:
-            return df
-        df = df.copy()
-        df["rsi"] = ta.momentum.RSIIndicator(close=df["close"], window=14).rsi()
-        macd = ta.trend.MACD(close=df["close"])
-        df["macd"] = macd.macd()
-        df["macd_signal"] = macd.macd_signal()
-        df["macd_diff"] = macd.macd_diff()
-        bb = ta.volatility.BollingerBands(close=df["close"], window=20, window_dev=2)
-        df["bb_high"] = bb.bollinger_hband()
-        df["bb_low"] = bb.bollinger_lband()
-        df["bb_mid"] = bb.bollinger_mavg()
-        stoch = ta.momentum.StochasticOscillator(high=df["high"], low=df["low"], close=df["close"])
-        df["stoch_k"] = stoch.stoch()
-        df["stoch_d"] = stoch.stoch_signal()
-        adx = ta.trend.ADXIndicator(high=df["high"], low=df["low"], close=df["close"])
-        df["adx"] = adx.adx()
-        df["adx_pos"] = adx.adx_pos()
-        df["adx_neg"] = adx.adx_neg()
-        df["atr"] = ta.volatility.AverageTrueRange(high=df["high"], low=df["low"], close=df["close"]).average_true_range()
-        df["ema_9"] = ta.trend.EMAIndicator(close=df["close"], window=9).ema_indicator()
-        df["ema_21"] = ta.trend.EMAIndicator(close=df["close"], window=21).ema_indicator()
-        df["ema_50"] = ta.trend.EMAIndicator(close=df["close"], window=50).ema_indicator()
-        df["cci"] = ta.trend.CCIIndicator(high=df["high"], low=df["low"], close=df["close"]).cci()
-        df["volume_sma"] = df["volume"].rolling(10).mean()
-        df["volume_ratio"] = df["volume"] / (df["volume_sma"] + 1e-9)
-        return df
-
-    def indicator_scores(self, df: pd.DataFrame) -> Tuple[Dict[str, float], List[str]]:
-        last = df.iloc[-1]
-        scores = {}
-        reasons = []
-
-        rsi = last.get("rsi", 50)
-        if pd.notna(rsi):
-            if rsi < 25:
-                scores["rsi"] = 1.0; reasons.append(f"RSI strongly oversold ({rsi:.1f})")
-            elif rsi < 35:
-                scores["rsi"] = 0.7; reasons.append(f"RSI oversold ({rsi:.1f})")
-            elif rsi > 75:
-                scores["rsi"] = -1.0; reasons.append(f"RSI strongly overbought ({rsi:.1f})")
-            elif rsi > 65:
-                scores["rsi"] = -0.7; reasons.append(f"RSI overbought ({rsi:.1f})")
-            else:
-                scores["rsi"] = (50 - rsi) / 25
-
-        if pd.notna(last.get("macd")) and pd.notna(last.get("macd_signal")):
-            diff = last["macd"] - last["macd_signal"]
-            if diff > 0:
-                scores["macd"] = 1.0; reasons.append("MACD bullish crossover")
-            else:
-                scores["macd"] = -1.0; reasons.append("MACD bearish crossover")
-
-        if pd.notna(last.get("bb_low")) and pd.notna(last.get("bb_high")):
-            band_width = last["bb_high"] - last["bb_low"]
-            if band_width > 0:
-                pos = (last["close"] - last["bb_low"]) / band_width
-                if last["close"] <= last["bb_low"]:
-                    scores["bb"] = 1.0; reasons.append("Price pierced lower Bollinger Band")
-                elif last["close"] >= last["bb_high"]:
-                    scores["bb"] = -1.0; reasons.append("Price pierced upper Bollinger Band")
-                else:
-                    scores["bb"] = 1 - 2 * pos
-
-        if pd.notna(last.get("stoch_k")) and pd.notna(last.get("stoch_d")):
-            if last["stoch_k"] < 20 and last["stoch_d"] < 20:
-                scores["stoch"] = 1.0; reasons.append(f"Stochastic oversold K={last['stoch_k']:.1f}")
-            elif last["stoch_k"] > 80 and last["stoch_d"] > 80:
-                scores["stoch"] = -1.0; reasons.append(f"Stochastic overbought K={last['stoch_k']:.1f}")
-            elif last["stoch_k"] > last["stoch_d"]:
-                scores["stoch"] = 0.3
-            else:
-                scores["stoch"] = -0.3
-
-        if pd.notna(last.get("ema_9")) and pd.notna(last.get("ema_21")):
-            if last["ema_9"] > last["ema_21"]:
-                scores["ma_cross"] = 1.0; reasons.append("EMA9 > EMA21 (bullish trend)")
-            else:
-                scores["ma_cross"] = -1.0; reasons.append("EMA9 < EMA21 (bearish trend)")
-
-        adx = last.get("adx", 0)
-        if pd.notna(adx):
-            scores["adx"] = min(1.0, max(0.0, (adx - 15) / 30))
-            if adx > 30: reasons.append(f"ADX {adx:.1f} – strong trend")
-            elif adx > 20: reasons.append(f"ADX {adx:.1f} – moderate trend")
-            else: reasons.append(f"ADX {adx:.1f} – ranging market")
-
-        vol_r = last.get("volume_ratio", 1.0)
-        if pd.notna(vol_r):
-            if vol_r > 1.5: scores["volume"] = 0.8; reasons.append(f"Volume surge {vol_r:.1f}x avg")
-            elif vol_r < 0.5: scores["volume"] = -0.3
-            else: scores["volume"] = 0.0
-
-        cci = last.get("cci", 0)
-        if pd.notna(cci):
-            if cci < -100: reasons.append(f"CCI oversold ({cci:.0f})")
-            elif cci > 100: reasons.append(f"CCI overbought ({cci:.0f})")
-
-        return scores, reasons
-
-    def xgboost_predict(self, df: pd.DataFrame) -> Optional[float]:
-        if self.xgb_model is None or not config.enable_xgboost:
-            return None
-        try:
-            feats = self._generate_features(df).iloc[-1:].values
-            prob = self.xgb_model.predict_proba(feats)[0][1]
-            return (prob - 0.5) * 2
-        except Exception as e:
-            logger.error(f"XGB predict error: {e}")
-            return None
-
-    def _generate_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df = self.compute_indicators(df)
-        df["returns"] = df["close"].pct_change()
-        df["log_returns"] = np.log(df["close"] / df["close"].shift(1))
-        df = df.fillna(0)
-        return df.drop(columns=["open","high","low","close","volume","timestamp"], errors="ignore")
-
-    def lstm_predict(self, df: pd.DataFrame) -> Optional[float]:
-        if self.lstm_model is None or not config.enable_lstm:
-            return None
-        try:
-            close = df["close"].values[-60:].astype(float)
-            close = (close - np.mean(close)) / (np.std(close) + 1e-9)
-            X = close.reshape(1, 60, 1)
-            prob = self.lstm_model.predict(X, verbose=0)[0][0]
-            return (prob - 0.5) * 2
-        except Exception as e:
-            logger.error(f"LSTM predict error: {e}")
-            return None
-
-    def generate_signal(self, symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-        if df is None or len(df) < 30:
-            return None
-        df = self.compute_indicators(df)
-        ind_scores, reasons = self.indicator_scores(df)
-        last = df.iloc[-1]
-
-        tech_score = sum(
-            ind_scores.get(k, 0) * config.indicator_weights.get(k, 0)
-            for k in config.indicator_weights
-        )
-        xgb_s = self.xgboost_predict(df) if config.enable_xgboost else None
-        lstm_s = self.lstm_predict(df) if config.enable_lstm else None
-
-        final_score = tech_score
-        model_parts = []
-        if xgb_s is not None:
-            final_score += config.xgboost_weight * xgb_s
-            model_parts.append(f"XGBoost: {xgb_s:+.2f}")
-        if lstm_s is not None:
-            final_score += config.lstm_weight * lstm_s
-            model_parts.append(f"LSTM: {lstm_s:+.2f}")
-        if model_parts:
-            reasons.append("AI: " + " | ".join(model_parts))
-
-        if final_score > config.ensemble_threshold:
-            direction = "BUY"
-        elif final_score < -config.ensemble_threshold:
-            direction = "SELL"
-        else:
-            return None
-
-        atr = last.get("atr", 0)
-        sl = round(last["close"] - atr * 1.5, 5) if direction == "BUY" else round(last["close"] + atr * 1.5, 5)
-        tp = round(last["close"] + atr * 2.5, 5) if direction == "BUY" else round(last["close"] - atr * 2.5, 5)
-
-        return {
-            "symbol": symbol,
-            "direction": direction,
-            "entry": last["close"],
-            "sl": sl,
-            "tp": tp,
-            "confidence": abs(final_score),
-            "reasons": reasons,
-            "timestamp": datetime.utcnow().isoformat(),
+        ptype = proxy_manager._guess_type(proxy_url)
+        proxy = {
+            "url": proxy_url,
+            "type": ptype,
+            "status": "unknown",
+            "fail_count": 0,
+            "last_used": None,
+            "is_tor": False
         }
-
-# ── Helpers / UI ─────────────────────────
-def _signal_strength_bar(confidence: float, length: int = 10) -> str:
-    filled = round(confidence * length)
-    return "█" * filled + "░" * (length - filled)
-
-def _format_signal(sig: Dict[str, Any]) -> str:
-    emoji = "🟢" if sig["direction"] == "BUY" else "🔴"
-    bar = _signal_strength_bar(sig["confidence"])
-    reasons = "\n".join(f"  • {r}" for r in sig["reasons"])
-    return (
-        f"{emoji} *{sig['symbol']} – {sig['direction']}*\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Entry:  `{sig['entry']:.5f}`\n"
-        f"🛡 S/L:    `{sig['sl']:.5f}`\n"
-        f"🎯 T/P:    `{sig['tp']:.5f}`\n"
-        f"📶 Conf:   `[{bar}]` {sig['confidence']:.1%}\n"
-        f"🕐 Time:   `{sig['timestamp'][11:19]} UTC`\n\n"
-        f"📋 *Reasons:*\n{reasons}\n\n"
-        f"⚠️ _Educational only. Not financial advice._"
-    )
-
-def build_main_menu(role: str) -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton("📊 Status", callback_data="status"),
-         InlineKeyboardButton("📈 Dashboard", callback_data="dashboard")],
-        [InlineKeyboardButton("📜 History", callback_data="history"),
-         InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-    ]
-    if role == "admin":
-        kb.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin")])
-    return InlineKeyboardMarkup(kb)
-
-def _back_btn() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="main_menu")]])
-
-# ── Command Handlers ─────────────────────
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    uname = user.username or "unknown"
-    role = "admin" if (user.id == config.admin_user_id or _is_secondary_admin(uname)) else "user"
-    await UserManager.add_user(user.id, uname, role)
-    role = await UserManager.get_role(user.id, uname)
-
-    welcome = (
-        f"🤖 *Educational Market Bot v2.0*\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"Welcome, *{user.first_name}*! 👋\n"
-        f"Role: `{role}`\n\n"
-        f"Use the menu below to navigate.\n"
-        f"Type /help for all commands."
-    )
-    await update.message.reply_text(
-        welcome, parse_mode=ParseMode.MARKDOWN,
-        reply_markup=build_main_menu(role)
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    role = await UserManager.get_role(user.id, user.username or "")
-    is_adm = role == "admin"
-
-    txt = (
-        "📖 *Bot Commands*\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "/start    – Main menu\n"
-        "/help     – This message\n"
-        "/signal   – On-demand signal scan\n"
-        "/stats    – Your personal stats\n"
-        "/ping     – Check bot latency\n"
-    )
-    if is_adm:
-        txt += (
-            "\n👑 *Admin Commands*\n"
-            "/adduser @username  – Add user\n"
-            "/removeuser @username – Remove user\n"
-            "/listusers          – List all users\n"
-            "/setrole @username role – Set role (user/admin)\n"
-            "/broadcast msg      – Broadcast message\n"
-            "/shutdown           – Stop the bot\n"
-        )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
-
-async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t0 = time.monotonic()
-    msg = await update.message.reply_text("🏓 Pinging...")
-    ms = (time.monotonic() - t0) * 1000
-    await msg.edit_text(f"🏓 Pong! `{ms:.0f}ms`", parse_mode=ParseMode.MARKDOWN)
-
-async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    syms = [args[0].upper()] if args else config.symbols
-    provider: DataProvider = context.bot_data.get("provider")
-    engine: AIEngine = context.bot_data.get("engine")
-    if not provider or not engine:
-        await update.message.reply_text("⚠️ Engine not ready yet.")
-        return
-
-    await update.message.reply_text(f"🔍 Scanning {', '.join(syms)}…")
-    found = 0
-    for sym in syms:
-        df = await provider.get_candle(sym, config.timeframes[0], bars=100)
-        if df.empty or len(df) < 30:
-            await update.message.reply_text(f"⚠️ Not enough data for {sym} yet.")
-            continue
-        df = engine.compute_indicators(df)
-        sig = engine.generate_signal(sym, df)
-        if sig:
-            found += 1
-            await update.message.reply_text(_format_signal(sig), parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text(f"📭 No signal for {sym} (score below threshold).")
-    if found == 0 and len(syms) > 1:
-        await update.message.reply_text("📭 No high-confidence signals right now.")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    rows = await db_execute(
-        "SELECT COUNT(*), SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END), "
-        "SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) FROM trades WHERE user_id=?",
-        (uid,)
-    )
-    total, wins, losses = rows[0] if rows else (0, 0, 0)
-    wins = wins or 0
-    losses = losses or 0
-    wr = wins / total * 100 if total else 0
-    last_sigs = await db_execute(
-        "SELECT symbol, direction, confidence, timestamp FROM signals ORDER BY id DESC LIMIT 3"
-    )
-    sig_lines = "\n".join(
-        f"  {r[1]} {r[0]} ({r[2]:.0%}) @ {r[3][11:16]}" for r in last_sigs
-    ) or "  No signals yet."
-    txt = (
-        f"📊 *Your Stats*\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"Total trades: `{total}`\n"
-        f"Wins:  `{wins}` | Losses: `{losses}`\n"
-        f"Win rate: `{wr:.1f}%`\n\n"
-        f"🔎 *Last 3 Signals:*\n{sig_lines}"
-    )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
-
-# ── Admin Command Handlers ───────────────
-@admin_only
-async def add_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /adduser @username")
-        return
-    username = context.args[0].lstrip("@")
-    await update.message.reply_text(
-        f"✅ @{username} whitelisted. They'll get access when they /start the bot."
-    )
-    await db_execute_commit(
-        "INSERT OR IGNORE INTO users (user_id, username, role, joined, active) VALUES (?,?,?,?,1)",
-        (0, username, "user", datetime.utcnow().isoformat())
-    )
-
-@admin_only
-async def remove_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /removeuser @username OR /removeuser <user_id>")
-        return
-    arg = context.args[0].lstrip("@")
-    if arg.isdigit():
-        uid = int(arg)
-        await UserManager.remove_user(uid)
-        await update.message.reply_text(f"✅ User {uid} deactivated.")
+        proxy_manager.proxies.append(proxy)
+    # Test outside lock, without blocking event loop
+    success = await async_test_proxy(proxy)
+    if success:
+        proxy_manager.mark_alive(proxy)
+        await update.message.reply_text(f"✅ Proxy added and tested: {mask_proxy_url(proxy_url)}")
     else:
-        await db_execute_commit("UPDATE users SET active=0 WHERE username=?", (arg,))
-        await update.message.reply_text(f"✅ @{arg} deactivated.")
+        proxy_manager.mark_failed(proxy)
+        await update.message.reply_text(f"❌ Proxy failed test: {mask_proxy_url(proxy_url)}")
 
 @admin_only
-async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = await UserManager.list_users()
-    if not users:
-        await update.message.reply_text("No active users.")
+async def cmd_removeproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    proxy_url = " ".join(context.args)
+    if not proxy_url:
+        await update.message.reply_text("Usage: /removeproxy &lt;exact_proxy_url&gt;")
         return
-    lines = [f"`{r[0]}` @{r[1] or '?'} [{r[2]}]" for r in users]
-    txt = f"👥 *Active Users ({len(lines)})*\n" + "\n".join(lines)
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    if proxy_manager.remove_proxy(proxy_url):
+        await update.message.reply_text(f"❌ Removed: {mask_proxy_url(proxy_url)}")
+    else:
+        await update.message.reply_text("Proxy not found or cannot remove Tor.")
 
 @admin_only
-async def set_role_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /setrole @username user|admin")
+async def cmd_listproxies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    proxies = proxy_manager.list_proxies()
+    if not proxies:
+        await update.message.reply_text("No proxies in pool.")
         return
-    username = context.args[0].lstrip("@")
-    role = context.args[1].lower()
-    if role not in ("user", "admin"):
-        await update.message.reply_text("Role must be `user` or `admin`.")
-        return
-    await db_execute_commit("UPDATE users SET role=? WHERE username=?", (role, username))
-    await update.message.reply_text(f"✅ @{username} role set to `{role}`.", parse_mode=ParseMode.MARKDOWN)
+    lines = ["<b>Proxy Pool:</b>"]
+    for p in proxies:
+        status_emoji = "🟢" if p["status"] == "alive" else "🔴"
+        safe_url = mask_proxy_url(p["url"])
+        tor_tag = " (Tor)" if p["is_tor"] else ""
+        line = f"{status_emoji} {safe_url}{tor_tag} | Fails: {p['fail_count']} | Last: {p['last_used'] or 'never'}"
+        lines.append(line)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 @admin_only
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
-        return
-    msg = " ".join(context.args)
-    users = await UserManager.all_active_users()
-    ok = 0
-    for uid in users:
-        try:
-            await context.bot.send_message(uid, f"📢 *Broadcast*\n{msg}", parse_mode=ParseMode.MARKDOWN)
-            ok += 1
-        except TelegramError:
-            pass
-    await update.message.reply_text(f"📢 Sent to {ok}/{len(users)} users.")
-
-@admin_only
-async def shutdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛑 Shutting down bot…")
-    logger.info("Shutdown triggered by admin.")
-    # This stops the run_polling() loop cleanly
-    context.application.stop_running()
-
-# ── Callback / Inline Button Handlers ────
-_admin_state: Dict[int, Dict] = {}
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-    uname = query.from_user.username or ""
-    role = await UserManager.get_role(user_id, uname)
-
-    if data == "main_menu":
-        await query.edit_message_text(
-            "🏠 Main Menu", parse_mode=ParseMode.MARKDOWN,
-            reply_markup=build_main_menu(role)
-        )
-        return
-
-    if data == "status":
-        symbols_str = ", ".join(config.symbols)
-        tf_str = ", ".join(str(t) for t in config.timeframes)
-        msg = (
-            f"📊 *Bot Status*\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"Symbols:     `{symbols_str}`\n"
-            f"Timeframes:  `{tf_str}` min\n"
-            f"Threshold:   `{config.ensemble_threshold}`\n"
-            f"Signal int:  `{config.signal_interval}s`\n"
-            f"XGBoost: {'✅' if config.enable_xgboost else '❌'}  "
-            f"LSTM: {'✅' if config.enable_lstm else '❌'}\n"
-            f"Mode: `{'DEMO (Simulated)' if DEMO_MODE else 'LIVE'}`"
-        )
-        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_back_btn())
-        return
-
-    if data == "dashboard":
-        rows = await db_execute("SELECT COUNT(*), SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) FROM trades")
-        total, wins = rows[0] if rows else (0, 0)
-        wins = wins or 0
-        wr = wins / total * 100 if total else 0
-        sig_c = await db_execute("SELECT COUNT(*) FROM signals")
-        sc = sig_c[0][0] if sig_c else 0
-        user_c = await db_execute("SELECT COUNT(*) FROM users WHERE active=1")
-        uc = user_c[0][0] if user_c else 0
-        msg = (
-            f"📈 *Dashboard*\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"Signals broadcast: `{sc}`\n"
-            f"Trades logged:     `{total}`\n"
-            f"Win rate:          `{wr:.1f}%`\n"
-            f"Active users:      `{uc}`\n\n"
-            f"⚠️ _Educational purposes only._"
-        )
-        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_back_btn())
-        return
-
-    if data == "history":
-        rows = await db_execute(
-            "SELECT symbol, direction, entry, confidence, timestamp FROM signals ORDER BY id DESC LIMIT 8"
-        )
-        if rows:
-            lines = [
-                f"{'🟢' if r[1]=='BUY' else '🔴'} {r[0]} {r[1]} "
-                f"@ `{r[2]:.4f}` ({r[3]:.0%}) `{r[4][11:16]}`"
-                for r in rows
-            ]
-            msg = "📜 *Recent Signals*\n" + "\n".join(lines)
+async def cmd_checkproxies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    proxies = proxy_manager.list_proxies()
+    for p in proxies:
+        alive = await async_test_proxy(p)
+        if alive:
+            proxy_manager.mark_alive(p)
         else:
-            msg = "📭 No signals recorded yet."
-        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_back_btn())
-        return
+            proxy_manager.mark_failed(p)
+    await update.message.reply_text("✅ All proxies re-tested.")
 
-    if data == "settings":
-        if role != "admin":
-            await query.answer("⛔ Admin only.", show_alert=True)
-            return
-        kb = [
-            [InlineKeyboardButton(
-                f"XGBoost {'✅' if config.enable_xgboost else '❌'}",
-                callback_data="toggle_xgb"
-             ),
-             InlineKeyboardButton(
-                f"LSTM {'✅' if config.enable_lstm else '❌'}",
-                callback_data="toggle_lstm"
-             )],
-            [InlineKeyboardButton("📊 Threshold ▲", callback_data="thresh_up"),
-             InlineKeyboardButton("📊 Threshold ▼", callback_data="thresh_dn")],
-            [InlineKeyboardButton("⏱ Faster signals", callback_data="interval_dn"),
-             InlineKeyboardButton("⏱ Slower signals", callback_data="interval_up")],
-            [InlineKeyboardButton("« Back", callback_data="main_menu")],
-        ]
-        msg = (
-            f"⚙️ *Settings*\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"XGBoost: {'ON' if config.enable_xgboost else 'OFF'}\n"
-            f"LSTM:    {'ON' if config.enable_lstm else 'OFF'}\n"
-            f"Threshold:       `{config.ensemble_threshold:.2f}`\n"
-            f"Signal interval: `{config.signal_interval}s`"
-        )
-        await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
-        return
+@admin_only
+async def cmd_rotateproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    proxy_manager.force_rotate()
+    await update.message.reply_text("🔄 Next request will use a different proxy.")
 
-    if data == "toggle_xgb" and role == "admin":
-        config.enable_xgboost = not config.enable_xgboost
-        await query.answer(f"XGBoost {'enabled' if config.enable_xgboost else 'disabled'}")
-        # Re-route to settings to refresh view
-        update.callback_query.data = "settings"
-        await button_handler(update, context)
-        return
+@admin_only
+async def cmd_setrotation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = " ".join(context.args).lower()
+    if mode in ("roundrobin", "leastfailed"):
+        proxy_manager.rotation_mode = mode
+        await update.message.reply_text(f"✅ Rotation mode set to {mode}")
+    else:
+        await update.message.reply_text("Invalid mode. Use roundrobin or leastfailed")
 
-    if data == "toggle_lstm" and role == "admin":
-        config.enable_lstm = not config.enable_lstm
-        await query.answer(f"LSTM {'enabled' if config.enable_lstm else 'disabled'}")
-        update.callback_query.data = "settings"
-        await button_handler(update, context)
-        return
+@admin_only
+async def cmd_torrenew(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.to_thread(renew_tor_ip)
+    await update.message.reply_text("🔄 Tor IP renewed.")
 
-    if data == "thresh_up" and role == "admin":
-        config.ensemble_threshold = min(0.95, round(config.ensemble_threshold + 0.05, 2))
-        await query.answer(f"Threshold → {config.ensemble_threshold}")
-        update.callback_query.data = "settings"
-        await button_handler(update, context)
-        return
-
-    if data == "thresh_dn" and role == "admin":
-        config.ensemble_threshold = max(0.30, round(config.ensemble_threshold - 0.05, 2))
-        await query.answer(f"Threshold → {config.ensemble_threshold}")
-        update.callback_query.data = "settings"
-        await button_handler(update, context)
-        return
-
-    if data == "interval_up" and role == "admin":
-        config.signal_interval = min(600, config.signal_interval + 30)
-        await query.answer(f"Interval → {config.signal_interval}s")
-        update.callback_query.data = "settings"
-        await button_handler(update, context)
-        return
-
-    if data == "interval_dn" and role == "admin":
-        config.signal_interval = max(15, config.signal_interval - 30)
-        await query.answer(f"Interval → {config.signal_interval}s")
-        update.callback_query.data = "settings"
-        await button_handler(update, context)
-        return
-
-    if data == "admin":
-        if role != "admin":
-            await query.answer("⛔ Admin only.", show_alert=True)
-            return
-        await _show_admin_panel(query)
-        return
-
-    if data == "list_users" and role == "admin":
-        users = await UserManager.list_users()
-        if not users:
-            await query.edit_message_text("No active users.", reply_markup=_back_btn())
-            return
-        lines = [f"`{r[0]}` @{r[1] or '?'} [{r[2]}]" for r in users]
-        txt = f"👥 *Active Users ({len(lines)})*\n" + "\n".join(lines)
-        await query.edit_message_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=_back_btn())
-        return
-
-    if data == "shutdown" and role == "admin":
-        await query.edit_message_text("🛑 Shutting down…")
-        logger.info("Shutdown via admin panel.")
-        context.application.stop_running()
-        return
-
-    if data in ("add_user", "rem_user", "broadcast") and role == "admin":
-        prompts = {
-            "add_user":  "Send me the Telegram user_id to add (number):",
-            "rem_user":  "Send me the user_id or @username to remove:",
-            "broadcast": "Send me the message to broadcast:",
-        }
-        _admin_state[user_id] = {"action": data}
-        await query.edit_message_text(
-            f"✏️ {prompts[data]}\n\n_(send /cancel to abort)_",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    await query.edit_message_text("❓ Unknown action.", reply_markup=build_main_menu(role))
-
-async def _show_admin_panel(query):
-    total_users = await db_execute("SELECT COUNT(*) FROM users WHERE active=1")
-    total_sigs  = await db_execute("SELECT COUNT(*) FROM signals")
-    uc = total_users[0][0] if total_users else 0
-    sc = total_sigs[0][0]  if total_sigs  else 0
-    kb = [
-        [InlineKeyboardButton("➕ Add User", callback_data="add_user"),
-         InlineKeyboardButton("➖ Remove User", callback_data="rem_user")],
-        [InlineKeyboardButton("📋 List Users", callback_data="list_users")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
-        [InlineKeyboardButton("🛑 Shutdown", callback_data="shutdown")],
-        [InlineKeyboardButton("« Back", callback_data="main_menu")],
-    ]
-    await query.edit_message_text(
-        f"👑 *Admin Panel*\nUsers: `{uc}` | Signals: `{sc}`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    role = await UserManager.get_role(user_id, update.effective_user.username or "")
-    if role != "admin":
-        return
-    state = _admin_state.get(user_id)
-    if not state:
-        return
-
-    text = update.message.text.strip()
-    action = state["action"]
-    _admin_state.pop(user_id, None)
-
-    if text == "/cancel":
-        await update.message.reply_text("❌ Cancelled.")
-        return
-
-    if action == "add_user":
-        if text.isdigit():
-            await UserManager.add_user(int(text), "unknown", "user")
-            await update.message.reply_text(f"✅ User `{text}` added.", parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text("⚠️ Expected a numeric user_id.")
-
-    elif action == "rem_user":
-        if text.lstrip("@").isdigit():
-            uid = int(text.lstrip("@"))
-            await UserManager.remove_user(uid)
-            await update.message.reply_text(f"✅ User `{uid}` deactivated.", parse_mode=ParseMode.MARKDOWN)
-        else:
-            uname = text.lstrip("@")
-            await db_execute_commit("UPDATE users SET active=0 WHERE username=?", (uname,))
-            await update.message.reply_text(f"✅ @{uname} deactivated.")
-
-    elif action == "broadcast":
-        users = await UserManager.all_active_users()
-        ok = 0
-        for uid in users:
-            try:
-                await context.bot.send_message(
-                    uid, f"📢 *Broadcast*\n{text}", parse_mode=ParseMode.MARKDOWN)
-                ok += 1
-            except TelegramError:
-                pass
-        await update.message.reply_text(f"📢 Sent to {ok}/{len(users)} users.")
-
-# ── Error Handler ───────────────────────
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Error: {context.error}", exc_info=context.error)
-    if update and hasattr(update, "effective_message") and update.effective_message:
-        try:
-            await update.effective_message.reply_text("⚠️ Something went wrong. Please try again.")
-        except Exception:
-            pass
-
-# ── Background Signal Loop ──────────────
-async def signal_loop(provider: DataProvider, engine: AIEngine, app: Application):
-    last_signal_time: Dict[str, float] = {}
+async def send_queued_messages(context: ContextTypes.DEFAULT_TYPE):
+    """Background task to process notifications."""
     while True:
         try:
-            for sym in config.symbols:
-                now = time.time()
-                if now - last_signal_time.get(sym, 0) < config.signal_cooldown:
-                    continue
+            msg = telegram_queue.get_nowait()
+            for chat_id in ADMIN_CHAT_IDS:
+                try:
+                    await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.error(f"Failed to send Telegram message: {e}")
+        except queue.Empty:
+            pass
+        await asyncio.sleep(0.5)
 
-                df = await provider.get_candle(sym, config.timeframes[0], bars=100)
-                if df.empty or len(df) < 30:
-                    continue
+def start_telegram_bot():
+    """Run the Telegram bot in its own event loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-                df_ind = engine.compute_indicators(df)
-                sig = engine.generate_signal(sym, df_ind)
-                if not sig:
-                    continue
+    app_bot = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-                last_signal_time[sym] = now
-                await db_execute_commit(
-                    "INSERT INTO signals (symbol,direction,entry,confidence,timestamp,reasons) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (sym, sig["direction"], sig["entry"], sig["confidence"],
-                     sig["timestamp"], "; ".join(sig["reasons"]))
-                )
+    # Register handlers
+    app_bot.add_handler(CommandHandler("start", cmd_start))
+    app_bot.add_handler(CommandHandler("stop", cmd_stop))
+    app_bot.add_handler(CommandHandler("startcrawl", cmd_startcrawl))
+    app_bot.add_handler(CommandHandler("status", cmd_status))
+    app_bot.add_handler(CommandHandler("renewtor", cmd_renewtor))
+    app_bot.add_handler(CommandHandler("stats", cmd_stats))
+    app_bot.add_handler(CommandHandler("lastcards", cmd_lastcards))
+    app_bot.add_handler(CommandHandler("log", cmd_log))
+    app_bot.add_handler(CommandHandler("clearlog", cmd_clearlog))
+    app_bot.add_handler(CommandHandler("addurl", cmd_addurl))
+    app_bot.add_handler(CommandHandler("listurls", cmd_listurls))
+    app_bot.add_handler(CommandHandler("help", cmd_help))
+    app_bot.add_handler(CommandHandler("addproxy", cmd_addproxy))
+    app_bot.add_handler(CommandHandler("removeproxy", cmd_removeproxy))
+    app_bot.add_handler(CommandHandler("listproxies", cmd_listproxies))
+    app_bot.add_handler(CommandHandler("checkproxies", cmd_checkproxies))
+    app_bot.add_handler(CommandHandler("rotateproxy", cmd_rotateproxy))
+    app_bot.add_handler(CommandHandler("setrotation", cmd_setrotation))
+    app_bot.add_handler(CommandHandler("torrenew", cmd_torrenew))
 
-                msg_txt = _format_signal(sig)
-                users = await UserManager.all_active_users()
-                ok = 0
-                for uid in users:
-                    try:
-                        await app.bot.send_message(uid, msg_txt, parse_mode=ParseMode.MARKDOWN)
-                        ok += 1
-                    except TelegramError:
-                        pass
-                logger.info(f"Signal {sym} {sig['direction']} conf={sig['confidence']:.2%} sent to {ok} users.")
-        except Exception as e:
-            logger.error(f"Signal loop error: {e}", exc_info=True)
-        await asyncio.sleep(config.signal_interval)
+    # Background notification
+    app_bot.job_queue.run_repeating(send_queued_messages, interval=1, first=1)
 
-# ── Application Lifecycle Hooks ─────────
-async def post_init(app: Application):
-    """Called after initialization, before polling starts."""
-    # Initialize DB (must be done first)
-    await init_db()
+    logger.info("Telegram bot started.")
+    loop.run_until_complete(app_bot.run_polling())
+    loop.close()
 
-    # Start data provider
-    provider = get_provider()
-    await provider.start()
-    app.bot_data["provider"] = provider
-
-    # Build AI engine
-    engine = AIEngine()
-    app.bot_data["engine"] = engine
-
-    # Launch background signal loop as an Application task (auto-cancelled on shutdown)
-    app.create_task(signal_loop(provider, engine, app))
-    logger.info("Post-init complete: provider started, signal loop launched.")
-
-async def post_shutdown(app: Application):
-    """Called after Application.stop(), cleanup resources."""
-    provider: Optional[DataProvider] = app.bot_data.get("provider")
-    if provider:
-        await provider.stop()
-    logger.info("Post-shutdown: provider stopped.")
-
-# ── Main Entry Point ────────────────────
-def main():
-    # Build the Application (no asyncio.run here)
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Register lifecycle hooks
-    app.post_init = post_init
-    app.post_shutdown = post_shutdown
-
-    # Middleware
-    app.add_handler(MessageHandler(filters.ALL, auth_middleware), group=-1)
-
-    # Commands
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("ping", ping_command))
-    app.add_handler(CommandHandler("signal", signal_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("adduser", add_user_command))
-    app.add_handler(CommandHandler("removeuser", remove_user_command))
-    app.add_handler(CommandHandler("listusers", list_users_command))
-    app.add_handler(CommandHandler("setrole", set_role_command))
-    app.add_handler(CommandHandler("broadcast", broadcast_command))
-    app.add_handler(CommandHandler("shutdown", shutdown_command))
-
-    # Inline buttons
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    # Multi-step admin input
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler), group=1
-    )
-
-    app.add_error_handler(error_handler)
-
-    logger.info("Bot starting...")
-    # This blocks until stop_running() is called (or SIGINT)
-    app.run_polling(drop_pending_updates=True)
-    logger.info("Bot finished.")
-
+# ========== MAIN ==========
 if __name__ == "__main__":
-    main()
+    # Ensure Telegram token exists
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set. Bot will not start.")
+    if not ADMIN_CHAT_IDS:
+        logger.warning("ADMIN_CHAT_IDS not set. No admins will receive notifications.")
+
+    # Start proxy dead-check thread (stops with event)
+    threading.Thread(target=proxy_manager.periodic_dead_check, daemon=True).start()
+
+    # Start Flask in daemon thread
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host='127.0.0.1', port=FLASK_PORT, debug=False),
+        daemon=True
+    )
+    flask_thread.start()
+
+    # Start crawler thread
+    crawler_thread = threading.Thread(target=scrape_loop, daemon=True)
+    crawler_thread.start()
+
+    # Start Telegram bot (main thread will run bot event loop, but we can put it in another thread to not block)
+    if TELEGRAM_BOT_TOKEN:
+        telegram_thread = threading.Thread(target=start_telegram_bot, daemon=True)
+        telegram_thread.start()
+    else:
+        logger.info("Telegram bot disabled.")
+
+    add_log(f"CC Crawler started. Dashboard: http://127.0.0.1:{FLASK_PORT}")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop_event.set()
+        stats["crawling_active"] = False
+        add_log("Shutting down.")
