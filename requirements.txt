@@ -1,9 +1,6 @@
-python-telegram-bot==20.3
-numpy
-pandas
-aiosqlite
-ta
-websockets
-python-dotenv
-xgboost
-tensorflow
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+stem>=1.8.0
+flask>=2.3.0
+python-telegram-bot>=20.3
+cryptography>=41.0.0
